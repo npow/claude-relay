@@ -1,7 +1,7 @@
 [project]
 name = "claude-relay"
-version = "0.1.0"
-description = "OpenAI-compatible API server that routes through Claude Code"
+version = "0.2.0"
+description = "OpenAI- and Anthropic-compatible API server that routes through Claude Code"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.10"
