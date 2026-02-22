@@ -5,13 +5,13 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
-Drop-in OpenAI API server that routes through [Claude Code](https://docs.anthropic.com/en/docs/claude-code).
+Drop-in OpenAI **and Anthropic** API server that routes through [Claude Code](https://docs.anthropic.com/en/docs/claude-code).
 
 ## Why
 
-You have tools that speak the OpenAI API. You have Claude Code with its tools, MCP servers, and agentic capabilities. **claude-relay** bridges the two — point any OpenAI-compatible client at it and every request flows through `claude -p` under the hood.
+You have tools that speak the OpenAI or Anthropic API. You have Claude Code with its tools, MCP servers, and agentic capabilities. **claude-relay** bridges the two — point any compatible client at it and every request flows through `claude -p` under the hood.
 
-- **Use Claude Code from any OpenAI client** — Cursor, Continue, aider, custom scripts
+- **Use Claude Code from any OpenAI or Anthropic client** — Cursor, Continue, aider, LangChain, custom scripts
 - **Keep Claude Code's superpowers** — tool use, MCP servers, file access, shell execution
 - **Zero config** — if `claude` works on your machine, so does this
 - **Real token usage** — reports actual token counts from Claude (not zeros)
@@ -64,12 +64,55 @@ resp = client.chat.completions.create(
 print(resp.choices[0].message.content)
 ```
 
-Or with curl:
+### Anthropic SDK
+
+```python
+import anthropic
+
+# Just set the base URL — the SDK reads ANTHROPIC_BASE_URL automatically
+# export ANTHROPIC_BASE_URL=http://localhost:8082
+client = anthropic.Anthropic(base_url="http://localhost:8082")
+
+# Streaming
+with client.messages.stream(
+    model="sonnet",
+    max_tokens=1024,
+    messages=[{"role": "user", "content": "Hello!"}],
+) as stream:
+    for text in stream.text_stream:
+        print(text, end="")
+
+# Non-streaming
+resp = client.messages.create(
+    model="sonnet",
+    max_tokens=1024,
+    messages=[{"role": "user", "content": "Hello!"}],
+)
+print(resp.content[0].text)
+```
+
+### LangChain
+
+```python
+from langchain_anthropic import ChatAnthropic
+
+# export ANTHROPIC_BASE_URL=http://localhost:8082
+llm = ChatAnthropic(model="sonnet")
+print(llm.invoke("Hello!").content)
+```
+
+### curl
 
 ```bash
+# OpenAI format
 curl http://localhost:8082/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"sonnet","messages":[{"role":"user","content":"Hello"}],"stream":true}'
+
+# Anthropic format
+curl http://localhost:8082/v1/messages \
+  -H "Content-Type: application/json" \
+  -d '{"model":"sonnet","max_tokens":1024,"messages":[{"role":"user","content":"Hello"}]}'
 ```
 
 ## Configuration
@@ -88,6 +131,7 @@ claude-relay serve [--host HOST] [--port PORT]
 | Endpoint | Method | Description |
 |---|---|---|
 | `/v1/chat/completions` | POST | Chat completions (OpenAI-compatible) |
+| `/v1/messages` | POST | Messages (Anthropic-compatible) |
 | `/v1/models` | GET | List available models |
 | `/health` | GET | Server and CLI status |
 
@@ -125,11 +169,12 @@ Pass any model name — it goes directly to `claude --model`:
 ## How it works
 
 ```
-OpenAI client  →  claude-relay  →  claude -p  →  Anthropic API
-  (SSE)            (FastAPI)      (stream-json)
+OpenAI client     ─┐
+                    ├→  claude-relay  →  claude -p  →  Anthropic API
+Anthropic client  ─┘     (FastAPI)      (stream-json)
 ```
 
-Each request spawns a `claude -p` process with `--output-format stream-json --include-partial-messages`. The proxy translates between the OpenAI wire format and Claude Code's streaming JSON protocol. Requests are stateless — no conversation history bleeds between calls.
+Each request spawns a `claude -p` process with `--output-format stream-json --include-partial-messages`. The proxy translates between the OpenAI or Anthropic wire format and Claude Code's streaming JSON protocol. Requests are stateless — no conversation history bleeds between calls.
 
 ## Development
 

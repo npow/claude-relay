@@ -6,7 +6,16 @@ from unittest.mock import AsyncMock, patch
 import pytest
 from httpx import ASGITransport, AsyncClient
 
-from claude_relay.server import app, build_claude_cmd, build_prompt, make_chat_response, make_stream_chunk
+from claude_relay.server import (
+    app,
+    build_claude_cmd,
+    build_prompt,
+    build_prompt_anthropic,
+    make_anthropic_response,
+    make_anthropic_stream_event,
+    make_chat_response,
+    make_stream_chunk,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -374,3 +383,271 @@ async def test_response_id_format(client):
 
     assert resp.json()["id"].startswith("chatcmpl-")
     assert len(resp.json()["id"]) == len("chatcmpl-") + 12
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: build_prompt_anthropic
+# ---------------------------------------------------------------------------
+
+
+class TestBuildPromptAnthropic:
+    def test_single_user_message(self):
+        system, prompt = build_prompt_anthropic(
+            [{"role": "user", "content": "Hello"}],
+        )
+        assert system is None
+        assert prompt == "Hello"
+
+    def test_system_string(self):
+        system, prompt = build_prompt_anthropic(
+            [{"role": "user", "content": "Hi"}],
+            system="You are helpful.",
+        )
+        assert system == "You are helpful."
+        assert prompt == "Hi"
+
+    def test_system_content_blocks(self):
+        system, _ = build_prompt_anthropic(
+            [{"role": "user", "content": "Hi"}],
+            system=[
+                {"type": "text", "text": "Rule 1"},
+                {"type": "text", "text": "Rule 2"},
+            ],
+        )
+        assert system == "Rule 1\n\nRule 2"
+
+    def test_multi_turn(self):
+        _, prompt = build_prompt_anthropic([
+            {"role": "user", "content": "2+2?"},
+            {"role": "assistant", "content": "4"},
+            {"role": "user", "content": "3+3?"},
+        ])
+        assert "User: 2+2?" in prompt
+        assert "Assistant: 4" in prompt
+        assert "User: 3+3?" in prompt
+
+    def test_content_array(self):
+        _, prompt = build_prompt_anthropic([{
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Describe this"},
+                {"type": "image", "source": {"type": "base64", "data": "..."}},
+            ],
+        }])
+        assert prompt == "Describe this"
+
+    def test_empty_messages(self):
+        system, prompt = build_prompt_anthropic([])
+        assert system is None
+        assert prompt == ""
+
+    def test_no_system(self):
+        system, _ = build_prompt_anthropic(
+            [{"role": "user", "content": "Hi"}],
+            system=None,
+        )
+        assert system is None
+
+
+# ---------------------------------------------------------------------------
+# Unit tests: Anthropic response builders
+# ---------------------------------------------------------------------------
+
+
+class TestMakeAnthropicResponse:
+    def test_basic(self):
+        resp = make_anthropic_response("Hello!", "sonnet")
+        assert resp["type"] == "message"
+        assert resp["role"] == "assistant"
+        assert resp["content"] == [{"type": "text", "text": "Hello!"}]
+        assert resp["stop_reason"] == "end_turn"
+        assert resp["id"].startswith("msg_")
+
+    def test_with_usage(self):
+        resp = make_anthropic_response("Hi", "opus", {"input_tokens": 10, "output_tokens": 20})
+        assert resp["usage"] == {"input_tokens": 10, "output_tokens": 20}
+
+    def test_without_usage(self):
+        resp = make_anthropic_response("Hi", "opus")
+        assert resp["usage"] == {"input_tokens": 0, "output_tokens": 0}
+
+
+class TestMakeAnthropicStreamEvent:
+    def test_format(self):
+        result = make_anthropic_stream_event("content_block_delta", {
+            "type": "content_block_delta",
+            "index": 0,
+            "delta": {"type": "text_delta", "text": "hi"},
+        })
+        assert result.startswith("event: content_block_delta\n")
+        assert "data: " in result
+        assert result.endswith("\n\n")
+        data = json.loads(result.split("data: ")[1].strip())
+        assert data["delta"]["text"] == "hi"
+
+
+# ---------------------------------------------------------------------------
+# Integration tests: Anthropic endpoints
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_anthropic_non_streaming(client):
+    data = _make_claude_stream_lines(["Hello!"], input_tokens=12, output_tokens=5)
+    proc = _mock_process(data.encode())
+
+    with patch(f"{MODULE}.asyncio.create_subprocess_exec", return_value=proc):
+        resp = await client.post("/v1/messages", json={
+            "model": "sonnet",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "Hi"}],
+        })
+
+    body = resp.json()
+    assert body["type"] == "message"
+    assert body["role"] == "assistant"
+    assert body["content"] == [{"type": "text", "text": "Hello!"}]
+    assert body["stop_reason"] == "end_turn"
+    assert body["usage"] == {"input_tokens": 12, "output_tokens": 5}
+
+
+@pytest.mark.anyio
+async def test_anthropic_streaming(client):
+    data = _make_claude_stream_lines(["Hello", " world", "!"])
+    proc = _mock_process(data.encode())
+
+    with patch(f"{MODULE}.asyncio.create_subprocess_exec", return_value=proc):
+        resp = await client.post("/v1/messages", json={
+            "model": "opus",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "Hi"}],
+            "stream": True,
+        })
+
+    assert "text/event-stream" in resp.headers["content-type"]
+
+    events = []
+    current_event = {}
+    for line in resp.text.split("\n"):
+        line = line.strip()
+        if line.startswith("event: "):
+            current_event["event"] = line[7:]
+        elif line.startswith("data: "):
+            current_event["data"] = json.loads(line[6:])
+            events.append(current_event)
+            current_event = {}
+
+    # Check event sequence
+    event_types = [e["event"] for e in events]
+    assert event_types[0] == "message_start"
+    assert event_types[1] == "content_block_start"
+    assert "content_block_delta" in event_types
+    assert event_types[-3] == "content_block_stop"
+    assert event_types[-2] == "message_delta"
+    assert event_types[-1] == "message_stop"
+
+    # Check text content
+    texts = [
+        e["data"]["delta"]["text"]
+        for e in events
+        if e["event"] == "content_block_delta"
+    ]
+    assert texts == ["Hello", " world", "!"]
+
+    # Check message_start structure
+    msg = events[0]["data"]["message"]
+    assert msg["role"] == "assistant"
+    assert msg["content"] == []
+
+    # Check message_delta has stop_reason
+    delta_event = [e for e in events if e["event"] == "message_delta"][0]
+    assert delta_event["data"]["delta"]["stop_reason"] == "end_turn"
+
+
+@pytest.mark.anyio
+async def test_anthropic_system_prompt(client):
+    data = _make_claude_stream_lines(["Arrr!"])
+    proc = _mock_process(data.encode())
+
+    with patch(f"{MODULE}.asyncio.create_subprocess_exec", return_value=proc) as mock_exec:
+        await client.post("/v1/messages", json={
+            "model": "haiku",
+            "max_tokens": 1024,
+            "system": "You are a pirate.",
+            "messages": [{"role": "user", "content": "Hello"}],
+        })
+
+    cmd = mock_exec.call_args[0]
+    idx = list(cmd).index("--system-prompt")
+    assert cmd[idx + 1] == "You are a pirate."
+
+
+@pytest.mark.anyio
+async def test_anthropic_multi_turn(client):
+    data = _make_claude_stream_lines(["6"])
+    proc = _mock_process(data.encode())
+
+    with patch(f"{MODULE}.asyncio.create_subprocess_exec", return_value=proc) as mock_exec:
+        await client.post("/v1/messages", json={
+            "model": "sonnet",
+            "max_tokens": 1024,
+            "messages": [
+                {"role": "user", "content": "2+2?"},
+                {"role": "assistant", "content": "4"},
+                {"role": "user", "content": "3+3?"},
+            ],
+        })
+
+    prompt_arg = mock_exec.call_args[0][-1]
+    assert "User: 2+2?" in prompt_arg
+    assert "Assistant: 4" in prompt_arg
+    assert "User: 3+3?" in prompt_arg
+
+
+@pytest.mark.anyio
+async def test_anthropic_no_prefix(client):
+    data = _make_claude_stream_lines(["Works"])
+    proc = _mock_process(data.encode())
+
+    with patch(f"{MODULE}.asyncio.create_subprocess_exec", return_value=proc):
+        resp = await client.post("/messages", json={
+            "model": "sonnet",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "Hi"}],
+        })
+    assert resp.json()["content"][0]["text"] == "Works"
+
+
+@pytest.mark.anyio
+async def test_anthropic_default_model(client):
+    data = _make_claude_stream_lines(["Hi"])
+    proc = _mock_process(data.encode())
+
+    with patch(f"{MODULE}.asyncio.create_subprocess_exec", return_value=proc):
+        resp = await client.post("/v1/messages", json={
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "Hi"}],
+        })
+    assert resp.json()["model"] == "sonnet"
+
+
+@pytest.mark.anyio
+async def test_anthropic_content_array(client):
+    data = _make_claude_stream_lines(["I see"])
+    proc = _mock_process(data.encode())
+
+    with patch(f"{MODULE}.asyncio.create_subprocess_exec", return_value=proc) as mock_exec:
+        await client.post("/v1/messages", json={
+            "model": "sonnet",
+            "max_tokens": 1024,
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "What is this?"},
+                    {"type": "image", "source": {"type": "base64", "data": "abc"}},
+                ],
+            }],
+        })
+
+    prompt_arg = mock_exec.call_args[0][-1]
+    assert prompt_arg == "What is this?"

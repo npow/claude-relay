@@ -1,4 +1,4 @@
-"""OpenAI-compatible API proxy that routes requests through Claude Code CLI."""
+"""OpenAI- and Anthropic-compatible API proxy that routes requests through Claude Code CLI."""
 
 import asyncio
 import json
@@ -68,6 +68,53 @@ def build_prompt(messages: list[dict]) -> tuple[Optional[str], str]:
     return system_prompt, prompt
 
 
+def build_prompt_anthropic(
+    messages: list[dict],
+    system: str | list[dict] | None = None,
+) -> tuple[Optional[str], str]:
+    """Convert Anthropic message format to (system_prompt, user_prompt).
+
+    Anthropic passes ``system`` as a top-level field (string or list of
+    content blocks), not inside the messages array.  Messages use the same
+    role/content structure but content can be ``str`` or
+    ``list[{type, text}]``.
+    """
+    # Build system prompt from the top-level system field.
+    if isinstance(system, list):
+        system_prompt = "\n\n".join(
+            b["text"] for b in system if b.get("type") == "text"
+        )
+    elif isinstance(system, str):
+        system_prompt = system
+    else:
+        system_prompt = None
+
+    # Normalise content blocks to plain strings.
+    def _text(content) -> str:
+        if isinstance(content, list):
+            return "\n".join(c["text"] for c in content if c.get("type") == "text")
+        return content or ""
+
+    conversation_parts: list[str] = []
+    for msg in messages:
+        role = msg.get("role", "user")
+        text = _text(msg.get("content", ""))
+        if role == "user":
+            conversation_parts.append(f"User: {text}")
+        elif role == "assistant":
+            conversation_parts.append(f"Assistant: {text}")
+
+    user_msgs = [m for m in messages if m.get("role") == "user"]
+    asst_msgs = [m for m in messages if m.get("role") == "assistant"]
+
+    if len(user_msgs) == 1 and not asst_msgs:
+        prompt = _text(user_msgs[0].get("content", ""))
+    else:
+        prompt = "\n\n".join(conversation_parts)
+
+    return system_prompt or None, prompt
+
+
 # ---------------------------------------------------------------------------
 # Claude CLI command
 # ---------------------------------------------------------------------------
@@ -132,6 +179,32 @@ def make_stream_chunk(
         "model": model,
         "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
     }
+
+
+# ---------------------------------------------------------------------------
+# Anthropic response builders
+# ---------------------------------------------------------------------------
+
+
+def make_anthropic_response(text: str, model: str, usage: dict | None = None) -> dict:
+    return {
+        "id": f"msg_{uuid.uuid4().hex[:24]}",
+        "type": "message",
+        "role": "assistant",
+        "content": [{"type": "text", "text": text}],
+        "model": model,
+        "stop_reason": "end_turn",
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens": (usage or {}).get("input_tokens", 0),
+            "output_tokens": (usage or {}).get("output_tokens", 0),
+        },
+    }
+
+
+def make_anthropic_stream_event(event_type: str, data: dict) -> str:
+    """Build one Anthropic SSE frame (``event:`` + ``data:`` lines)."""
+    return f"event: {event_type}\ndata: {json.dumps(data)}\n\n"
 
 
 # ---------------------------------------------------------------------------
@@ -233,3 +306,127 @@ async def chat_completions(request: Request):
         )
 
     return JSONResponse(content=make_chat_response(result_text, model, usage))
+
+
+# ---------------------------------------------------------------------------
+# Anthropic Messages API
+# ---------------------------------------------------------------------------
+
+
+@app.post("/v1/messages")
+@app.post("/messages")
+async def anthropic_messages(request: Request):
+    body = await request.json()
+    messages = body.get("messages", [])
+    model = body.get("model", "sonnet")
+    system = body.get("system")
+    stream = body.get("stream", False)
+
+    system_prompt, prompt = build_prompt_anthropic(messages, system)
+    cmd = build_claude_cmd(prompt, system_prompt, model)
+
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    if stream:
+        msg_id = f"msg_{uuid.uuid4().hex[:24]}"
+
+        async def generate():
+            # message_start
+            yield make_anthropic_stream_event("message_start", {
+                "type": "message_start",
+                "message": {
+                    "id": msg_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "model": model,
+                    "stop_reason": None,
+                    "stop_sequence": None,
+                    "usage": {"input_tokens": 0, "output_tokens": 0},
+                },
+            })
+            # content_block_start
+            yield make_anthropic_stream_event("content_block_start", {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""},
+            })
+            output_tokens = 0
+            async for raw in proc.stdout:
+                line = raw.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if event.get("type") != "stream_event":
+                    continue
+                inner = event.get("event", {})
+                if inner.get("type") == "content_block_delta":
+                    delta = inner.get("delta", {})
+                    if delta.get("type") == "text_delta":
+                        text = delta.get("text", "")
+                        if text:
+                            yield make_anthropic_stream_event("content_block_delta", {
+                                "type": "content_block_delta",
+                                "index": 0,
+                                "delta": {"type": "text_delta", "text": text},
+                            })
+                elif inner.get("type") == "message_delta":
+                    output_tokens = inner.get("usage", {}).get("output_tokens", 0)
+            # content_block_stop
+            yield make_anthropic_stream_event("content_block_stop", {
+                "type": "content_block_stop",
+                "index": 0,
+            })
+            # message_delta
+            yield make_anthropic_stream_event("message_delta", {
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                "usage": {"output_tokens": output_tokens},
+            })
+            # message_stop
+            yield make_anthropic_stream_event("message_stop", {
+                "type": "message_stop",
+            })
+            await proc.wait()
+
+        return StreamingResponse(
+            generate(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+        )
+
+    # Non-streaming
+    result_text = ""
+    usage: dict = {}
+    async for raw in proc.stdout:
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") == "result":
+            result_text = event.get("result", "")
+            usage = event.get("usage", {})
+
+    await proc.wait()
+
+    if proc.returncode != 0:
+        stderr = await proc.stderr.read()
+        return JSONResponse(
+            status_code=500,
+            content={
+                "type": "error",
+                "error": {"type": "server_error", "message": f"Claude CLI error: {stderr.decode()}"},
+            },
+        )
+
+    return JSONResponse(content=make_anthropic_response(result_text, model, usage))
