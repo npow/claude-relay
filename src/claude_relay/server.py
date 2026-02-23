@@ -2,9 +2,11 @@
 
 import asyncio
 import json
+import os
 import shutil
 import time
 import uuid
+from contextlib import asynccontextmanager as _acm
 from typing import Optional
 
 from fastapi import FastAPI, Request
@@ -13,7 +15,80 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import __version__
 
-app = FastAPI(title="claude-relay", version=__version__)
+# ---------------------------------------------------------------------------
+# Concurrency & lifecycle state
+# ---------------------------------------------------------------------------
+
+_max_concurrent: int = int(os.environ.get("CLAUDE_RELAY_MAX_CONCURRENT", "10"))
+_request_timeout: float = float(os.environ.get("CLAUDE_RELAY_REQUEST_TIMEOUT", "300"))
+_active_processes: set = set()
+_active_count: int = 0
+_semaphore: asyncio.Semaphore = asyncio.Semaphore(_max_concurrent)
+
+
+def configure(max_concurrent: int = 10, request_timeout: float = 300.0) -> None:
+    """Set concurrency and timeout limits.  Call before starting the server."""
+    global _semaphore, _max_concurrent, _request_timeout, _active_count
+    _max_concurrent = max_concurrent
+    _request_timeout = request_timeout
+    _active_count = 0
+    _semaphore = asyncio.Semaphore(max_concurrent)
+
+
+async def _acquire_slot() -> bool:
+    """Non-blocking concurrency-slot acquire.  Returns *True* on success."""
+    global _active_count
+    if _semaphore.locked():
+        return False
+    await _semaphore.acquire()
+    _active_count += 1
+    return True
+
+
+def _release_slot() -> None:
+    global _active_count
+    _active_count -= 1
+    _semaphore.release()
+
+
+async def _cleanup_process(proc: asyncio.subprocess.Process) -> None:
+    """Kill *proc* if still running, wait for it, and deregister."""
+    _active_processes.discard(proc)
+    if proc.returncode is None:
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            await proc.wait()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Lifespan (graceful shutdown)
+# ---------------------------------------------------------------------------
+
+
+@_acm
+async def _lifespan(_app: FastAPI):
+    yield
+    # Shutdown: kill all tracked subprocesses
+    procs = list(_active_processes)
+    for p in procs:
+        try:
+            p.kill()
+        except ProcessLookupError:
+            pass
+    for p in procs:
+        try:
+            await p.wait()
+        except Exception:
+            pass
+    _active_processes.clear()
+
+
+app = FastAPI(title="claude-relay", version=__version__, lifespan=_lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -208,6 +283,30 @@ def make_anthropic_stream_event(event_type: str, data: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Subprocess helpers
+# ---------------------------------------------------------------------------
+
+
+async def _read_cli_result(proc) -> tuple[str, dict]:
+    """Read all stdout from a Claude CLI subprocess, return *(text, usage)*."""
+    result_text = ""
+    usage: dict = {}
+    async for raw in proc.stdout:
+        line = raw.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") == "result":
+            result_text = event.get("result", "")
+            usage = event.get("usage", {})
+    await proc.wait()
+    return result_text, usage
+
+
+# ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
 
@@ -219,6 +318,8 @@ async def health():
         "status": "ok" if cli_found else "degraded",
         "version": __version__,
         "claude_cli": cli_found,
+        "active_requests": _active_count,
+        "max_concurrent": _max_concurrent,
     }
 
 
@@ -239,11 +340,26 @@ async def chat_completions(request: Request):
     system_prompt, prompt = build_prompt(messages)
     cmd = build_claude_cmd(prompt, system_prompt, model)
 
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
+    if not await _acquire_slot():
+        return JSONResponse(
+            status_code=503,
+            content={"error": {"message": "Server at capacity", "type": "capacity_error"}},
+        )
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except OSError as exc:
+        _release_slot()
+        return JSONResponse(
+            status_code=503,
+            content={"error": {"message": f"Failed to start subprocess: {exc}", "type": "server_error"}},
+        )
+
+    _active_processes.add(proc)
 
     if stream:
         chunk_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
@@ -251,29 +367,35 @@ async def chat_completions(request: Request):
         initial["choices"][0]["delta"] = {"role": "assistant", "content": ""}
 
         async def generate():
-            yield f"data: {json.dumps(initial)}\n\n"
-            async for raw in proc.stdout:
-                line = raw.strip()
-                if not line:
-                    continue
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if event.get("type") != "stream_event":
-                    continue
-                inner = event.get("event", {})
-                if inner.get("type") == "content_block_delta":
-                    delta = inner.get("delta", {})
-                    if delta.get("type") == "text_delta":
-                        text = delta.get("text", "")
-                        if text:
-                            yield f"data: {json.dumps(make_stream_chunk(text, model, chunk_id))}\n\n"
-                elif inner.get("type") == "message_delta":
-                    if inner.get("delta", {}).get("stop_reason"):
-                        yield f"data: {json.dumps(make_stream_chunk('', model, chunk_id, finish_reason='stop'))}\n\n"
-            yield "data: [DONE]\n\n"
-            await proc.wait()
+            try:
+                deadline = time.monotonic() + _request_timeout
+                yield f"data: {json.dumps(initial)}\n\n"
+                async for raw in proc.stdout:
+                    if time.monotonic() > deadline:
+                        break
+                    line = raw.strip()
+                    if not line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if event.get("type") != "stream_event":
+                        continue
+                    inner = event.get("event", {})
+                    if inner.get("type") == "content_block_delta":
+                        delta = inner.get("delta", {})
+                        if delta.get("type") == "text_delta":
+                            text = delta.get("text", "")
+                            if text:
+                                yield f"data: {json.dumps(make_stream_chunk(text, model, chunk_id))}\n\n"
+                    elif inner.get("type") == "message_delta":
+                        if inner.get("delta", {}).get("stop_reason"):
+                            yield f"data: {json.dumps(make_stream_chunk('', model, chunk_id, finish_reason='stop'))}\n\n"
+                yield "data: [DONE]\n\n"
+            finally:
+                await _cleanup_process(proc)
+                _release_slot()
 
         return StreamingResponse(
             generate(),
@@ -282,21 +404,20 @@ async def chat_completions(request: Request):
         )
 
     # Non-streaming
-    result_text = ""
-    usage: dict = {}
-    async for raw in proc.stdout:
-        line = raw.strip()
-        if not line:
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if event.get("type") == "result":
-            result_text = event.get("result", "")
-            usage = event.get("usage", {})
+    try:
+        result_text, usage = await asyncio.wait_for(
+            _read_cli_result(proc), timeout=_request_timeout,
+        )
+    except asyncio.TimeoutError:
+        await _cleanup_process(proc)
+        _release_slot()
+        return JSONResponse(
+            status_code=504,
+            content={"error": {"message": "Request timed out", "type": "timeout_error"}},
+        )
 
-    await proc.wait()
+    _active_processes.discard(proc)
+    _release_slot()
 
     if proc.returncode != 0:
         stderr = await proc.stderr.read()
@@ -325,76 +446,103 @@ async def anthropic_messages(request: Request):
     system_prompt, prompt = build_prompt_anthropic(messages, system)
     cmd = build_claude_cmd(prompt, system_prompt, model)
 
-    proc = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
+    if not await _acquire_slot():
+        return JSONResponse(
+            status_code=503,
+            content={
+                "type": "error",
+                "error": {"type": "overloaded_error", "message": "Server at capacity"},
+            },
+        )
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except OSError as exc:
+        _release_slot()
+        return JSONResponse(
+            status_code=503,
+            content={
+                "type": "error",
+                "error": {"type": "server_error", "message": f"Failed to start subprocess: {exc}"},
+            },
+        )
+
+    _active_processes.add(proc)
 
     if stream:
         msg_id = f"msg_{uuid.uuid4().hex[:24]}"
 
         async def generate():
-            # message_start
-            yield make_anthropic_stream_event("message_start", {
-                "type": "message_start",
-                "message": {
-                    "id": msg_id,
-                    "type": "message",
-                    "role": "assistant",
-                    "content": [],
-                    "model": model,
-                    "stop_reason": None,
-                    "stop_sequence": None,
-                    "usage": {"input_tokens": 0, "output_tokens": 0},
-                },
-            })
-            # content_block_start
-            yield make_anthropic_stream_event("content_block_start", {
-                "type": "content_block_start",
-                "index": 0,
-                "content_block": {"type": "text", "text": ""},
-            })
-            output_tokens = 0
-            async for raw in proc.stdout:
-                line = raw.strip()
-                if not line:
-                    continue
-                try:
-                    event = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if event.get("type") != "stream_event":
-                    continue
-                inner = event.get("event", {})
-                if inner.get("type") == "content_block_delta":
-                    delta = inner.get("delta", {})
-                    if delta.get("type") == "text_delta":
-                        text = delta.get("text", "")
-                        if text:
-                            yield make_anthropic_stream_event("content_block_delta", {
-                                "type": "content_block_delta",
-                                "index": 0,
-                                "delta": {"type": "text_delta", "text": text},
-                            })
-                elif inner.get("type") == "message_delta":
-                    output_tokens = inner.get("usage", {}).get("output_tokens", 0)
-            # content_block_stop
-            yield make_anthropic_stream_event("content_block_stop", {
-                "type": "content_block_stop",
-                "index": 0,
-            })
-            # message_delta
-            yield make_anthropic_stream_event("message_delta", {
-                "type": "message_delta",
-                "delta": {"stop_reason": "end_turn", "stop_sequence": None},
-                "usage": {"output_tokens": output_tokens},
-            })
-            # message_stop
-            yield make_anthropic_stream_event("message_stop", {
-                "type": "message_stop",
-            })
-            await proc.wait()
+            try:
+                deadline = time.monotonic() + _request_timeout
+                # message_start
+                yield make_anthropic_stream_event("message_start", {
+                    "type": "message_start",
+                    "message": {
+                        "id": msg_id,
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [],
+                        "model": model,
+                        "stop_reason": None,
+                        "stop_sequence": None,
+                        "usage": {"input_tokens": 0, "output_tokens": 0},
+                    },
+                })
+                # content_block_start
+                yield make_anthropic_stream_event("content_block_start", {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "text", "text": ""},
+                })
+                output_tokens = 0
+                async for raw in proc.stdout:
+                    if time.monotonic() > deadline:
+                        break
+                    line = raw.strip()
+                    if not line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if event.get("type") != "stream_event":
+                        continue
+                    inner = event.get("event", {})
+                    if inner.get("type") == "content_block_delta":
+                        delta = inner.get("delta", {})
+                        if delta.get("type") == "text_delta":
+                            text = delta.get("text", "")
+                            if text:
+                                yield make_anthropic_stream_event("content_block_delta", {
+                                    "type": "content_block_delta",
+                                    "index": 0,
+                                    "delta": {"type": "text_delta", "text": text},
+                                })
+                    elif inner.get("type") == "message_delta":
+                        output_tokens = inner.get("usage", {}).get("output_tokens", 0)
+                # content_block_stop
+                yield make_anthropic_stream_event("content_block_stop", {
+                    "type": "content_block_stop",
+                    "index": 0,
+                })
+                # message_delta
+                yield make_anthropic_stream_event("message_delta", {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                    "usage": {"output_tokens": output_tokens},
+                })
+                # message_stop
+                yield make_anthropic_stream_event("message_stop", {
+                    "type": "message_stop",
+                })
+            finally:
+                await _cleanup_process(proc)
+                _release_slot()
 
         return StreamingResponse(
             generate(),
@@ -403,21 +551,23 @@ async def anthropic_messages(request: Request):
         )
 
     # Non-streaming
-    result_text = ""
-    usage: dict = {}
-    async for raw in proc.stdout:
-        line = raw.strip()
-        if not line:
-            continue
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if event.get("type") == "result":
-            result_text = event.get("result", "")
-            usage = event.get("usage", {})
+    try:
+        result_text, usage = await asyncio.wait_for(
+            _read_cli_result(proc), timeout=_request_timeout,
+        )
+    except asyncio.TimeoutError:
+        await _cleanup_process(proc)
+        _release_slot()
+        return JSONResponse(
+            status_code=504,
+            content={
+                "type": "error",
+                "error": {"type": "timeout_error", "message": "Request timed out"},
+            },
+        )
 
-    await proc.wait()
+    _active_processes.discard(proc)
+    _release_slot()
 
     if proc.returncode != 0:
         stderr = await proc.stderr.read()

@@ -1,16 +1,20 @@
 """Tests for claude-relay."""
 
+import asyncio
 import json
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from claude_relay import server as _server_mod
 from claude_relay.server import (
+    _cleanup_process,
     app,
     build_claude_cmd,
     build_prompt,
     build_prompt_anthropic,
+    configure,
     make_anthropic_response,
     make_anthropic_stream_event,
     make_chat_response,
@@ -53,6 +57,7 @@ def _mock_process(stdout_data: bytes, returncode: int = 0):
     proc = AsyncMock()
     proc.returncode = returncode
     proc.wait = AsyncMock(return_value=returncode)
+    proc.kill = Mock()
     proc.stderr = AsyncMock()
     proc.stderr.read = AsyncMock(return_value=b"error")
 
@@ -67,6 +72,14 @@ def _mock_process(stdout_data: bytes, returncode: int = 0):
 @pytest.fixture
 def client():
     return AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
+
+
+@pytest.fixture(autouse=True)
+def _reset_server_state():
+    """Reset concurrency state between tests."""
+    configure(max_concurrent=10, request_timeout=300.0)
+    yield
+    configure(max_concurrent=10, request_timeout=300.0)
 
 
 # ---------------------------------------------------------------------------
@@ -651,3 +664,153 @@ async def test_anthropic_content_array(client):
 
     prompt_arg = mock_exec.call_args[0][-1]
     assert prompt_arg == "What is this?"
+
+
+# ---------------------------------------------------------------------------
+# Load management tests
+# ---------------------------------------------------------------------------
+
+
+class TestConcurrencyLimits:
+    @pytest.mark.anyio
+    async def test_rejects_when_full_openai(self, client):
+        """All slots taken -> 503 for OpenAI endpoint."""
+        configure(max_concurrent=0)
+        resp = await client.post("/v1/chat/completions", json={
+            "model": "sonnet", "messages": [{"role": "user", "content": "Hi"}],
+        })
+        assert resp.status_code == 503
+        assert resp.json()["error"]["type"] == "capacity_error"
+
+    @pytest.mark.anyio
+    async def test_rejects_when_full_anthropic(self, client):
+        """All slots taken -> 503 for Anthropic endpoint."""
+        configure(max_concurrent=0)
+        resp = await client.post("/v1/messages", json={
+            "model": "sonnet", "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "Hi"}],
+        })
+        assert resp.status_code == 503
+        assert resp.json()["error"]["type"] == "overloaded_error"
+
+
+class TestRequestTimeout:
+    @pytest.mark.anyio
+    async def test_timeout_openai(self, client):
+        """Subprocess exceeding timeout -> 504."""
+        configure(max_concurrent=10, request_timeout=0.05)
+
+        proc = AsyncMock()
+        proc.returncode = None
+        proc.wait = AsyncMock(return_value=0)
+        proc.kill = Mock()
+        proc.stderr = AsyncMock()
+        proc.stderr.read = AsyncMock(return_value=b"")
+
+        async def _slow():
+            await asyncio.sleep(100)
+            yield b""
+
+        proc.stdout = _slow()
+
+        with patch(f"{MODULE}.asyncio.create_subprocess_exec", return_value=proc):
+            resp = await client.post("/v1/chat/completions", json={
+                "model": "sonnet", "messages": [{"role": "user", "content": "Hi"}],
+            })
+
+        assert resp.status_code == 504
+        assert resp.json()["error"]["type"] == "timeout_error"
+        proc.kill.assert_called_once()
+
+    @pytest.mark.anyio
+    async def test_timeout_anthropic(self, client):
+        """Subprocess exceeding timeout -> 504 for Anthropic endpoint."""
+        configure(max_concurrent=10, request_timeout=0.05)
+
+        proc = AsyncMock()
+        proc.returncode = None
+        proc.wait = AsyncMock(return_value=0)
+        proc.kill = Mock()
+        proc.stderr = AsyncMock()
+        proc.stderr.read = AsyncMock(return_value=b"")
+
+        async def _slow():
+            await asyncio.sleep(100)
+            yield b""
+
+        proc.stdout = _slow()
+
+        with patch(f"{MODULE}.asyncio.create_subprocess_exec", return_value=proc):
+            resp = await client.post("/v1/messages", json={
+                "model": "sonnet", "max_tokens": 1024,
+                "messages": [{"role": "user", "content": "Hi"}],
+            })
+
+        assert resp.status_code == 504
+        assert resp.json()["error"]["type"] == "timeout_error"
+        proc.kill.assert_called_once()
+
+
+class TestSubprocessCleanup:
+    @pytest.mark.anyio
+    async def test_cleanup_kills_running_process(self):
+        """_cleanup_process kills a subprocess that is still running."""
+        proc = AsyncMock()
+        proc.returncode = None
+        proc.kill = Mock()
+        proc.wait = AsyncMock()
+
+        _server_mod._active_processes.add(proc)
+
+        await _cleanup_process(proc)
+
+        proc.kill.assert_called_once()
+        proc.wait.assert_awaited_once()
+        assert proc not in _server_mod._active_processes
+
+    @pytest.mark.anyio
+    async def test_cleanup_skips_finished_process(self):
+        """_cleanup_process does not kill a completed subprocess."""
+        proc = AsyncMock()
+        proc.returncode = 0
+        proc.kill = Mock()
+        proc.wait = AsyncMock()
+
+        _server_mod._active_processes.add(proc)
+
+        await _cleanup_process(proc)
+
+        proc.kill.assert_not_called()
+        assert proc not in _server_mod._active_processes
+
+
+class TestHealthLoadInfo:
+    @pytest.mark.anyio
+    async def test_reports_active_requests(self, client):
+        """Health endpoint includes active_requests and max_concurrent."""
+        configure(max_concurrent=42)
+        resp = await client.get("/health")
+        body = resp.json()
+        assert body["active_requests"] == 0
+        assert body["max_concurrent"] == 42
+
+
+class TestConfigure:
+    def test_sets_limits(self):
+        """configure() updates module-level limits."""
+        configure(max_concurrent=5, request_timeout=60.0)
+        assert _server_mod._max_concurrent == 5
+        assert _server_mod._request_timeout == 60.0
+
+    @pytest.mark.anyio
+    async def test_acquire_and_release(self):
+        """Slots can be acquired up to the limit, then rejected."""
+        configure(max_concurrent=2)
+        assert await _server_mod._acquire_slot() is True
+        assert await _server_mod._acquire_slot() is True
+        assert await _server_mod._acquire_slot() is False  # full
+        _server_mod._release_slot()
+        assert await _server_mod._acquire_slot() is True  # freed one
+        # Clean up acquired slots
+        _server_mod._release_slot()
+        _server_mod._release_slot()
