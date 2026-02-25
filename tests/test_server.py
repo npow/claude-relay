@@ -14,10 +14,12 @@ from claude_relay.server import (
     build_claude_cmd,
     build_prompt,
     build_prompt_anthropic,
+    build_prompt_responses,
     configure,
     make_anthropic_response,
     make_anthropic_stream_event,
     make_chat_response,
+    make_responses_response,
     make_stream_chunk,
 )
 
@@ -462,6 +464,31 @@ class TestBuildPromptAnthropic:
         assert system is None
 
 
+class TestBuildPromptResponses:
+    def test_string_input(self):
+        system, prompt = build_prompt_responses("Hello")
+        assert system is None
+        assert prompt == "Hello"
+
+    def test_message_input_blocks(self):
+        system, prompt = build_prompt_responses([
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "Describe this"},
+                    {"type": "input_image", "image_url": "http://example.com/img.png"},
+                ],
+            }
+        ])
+        assert system is None
+        assert prompt == "Describe this"
+
+    def test_instructions_become_system(self):
+        system, prompt = build_prompt_responses("Hi", instructions="You are concise.")
+        assert system == "You are concise."
+        assert prompt == "Hi"
+
+
 # ---------------------------------------------------------------------------
 # Unit tests: Anthropic response builders
 # ---------------------------------------------------------------------------
@@ -499,9 +526,68 @@ class TestMakeAnthropicStreamEvent:
         assert data["delta"]["text"] == "hi"
 
 
+class TestMakeResponsesResponse:
+    def test_basic(self):
+        resp = make_responses_response("Hello!", "sonnet")
+        assert resp["object"] == "response"
+        assert resp["status"] == "completed"
+        assert resp["output_text"] == "Hello!"
+        assert resp["output"][0]["content"][0]["type"] == "output_text"
+        assert resp["id"].startswith("resp_")
+
+    def test_with_usage(self):
+        resp = make_responses_response("Hi", "opus", {"input_tokens": 10, "output_tokens": 20})
+        assert resp["usage"] == {"input_tokens": 10, "output_tokens": 20, "total_tokens": 30}
+
+
 # ---------------------------------------------------------------------------
 # Integration tests: Anthropic endpoints
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.anyio
+async def test_responses_non_streaming(client):
+    data = _make_claude_stream_lines(["Hello!"], input_tokens=12, output_tokens=5)
+    proc = _mock_process(data.encode())
+
+    with patch(f"{MODULE}.asyncio.create_subprocess_exec", return_value=proc):
+        resp = await client.post("/v1/responses", json={
+            "model": "sonnet",
+            "input": "Hi",
+        })
+
+    body = resp.json()
+    assert body["object"] == "response"
+    assert body["output_text"] == "Hello!"
+    assert body["usage"] == {"input_tokens": 12, "output_tokens": 5, "total_tokens": 17}
+
+
+@pytest.mark.anyio
+async def test_responses_streaming(client):
+    data = _make_claude_stream_lines(["Hello", " world", "!"])
+    proc = _mock_process(data.encode())
+
+    with patch(f"{MODULE}.asyncio.create_subprocess_exec", return_value=proc):
+        resp = await client.post("/v1/responses", json={
+            "model": "sonnet",
+            "input": "Hi",
+            "stream": True,
+        })
+
+    assert "text/event-stream" in resp.headers["content-type"]
+    events = []
+    for line in resp.text.strip().split("\n"):
+        line = line.strip()
+        if line.startswith("data: ") and line != "data: [DONE]":
+            events.append(json.loads(line[6:]))
+        elif line == "data: [DONE]":
+            events.append("[DONE]")
+
+    assert events[0]["type"] == "response.created"
+    delta_texts = [e["delta"] for e in events if e != "[DONE]" and e["type"] == "response.output_text.delta"]
+    assert delta_texts == ["Hello", " world", "!"]
+    assert any(e != "[DONE]" and e["type"] == "response.completed" for e in events)
+    assert events[-1] == "[DONE]"
 
 
 @pytest.mark.anyio

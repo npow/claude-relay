@@ -190,6 +190,44 @@ def build_prompt_anthropic(
     return system_prompt or None, prompt
 
 
+def build_prompt_responses(
+    input_data,
+    instructions: str | None = None,
+) -> tuple[Optional[str], str]:
+    """Convert OpenAI Responses API input to (system_prompt, user_prompt)."""
+    messages: list[dict] = []
+
+    if isinstance(input_data, str):
+        messages.append({"role": "user", "content": input_data})
+    elif isinstance(input_data, list):
+        for item in input_data:
+            if not isinstance(item, dict):
+                continue
+            if "role" in item:
+                role = item.get("role", "user")
+                content = item.get("content", "")
+                if isinstance(content, str):
+                    messages.append({"role": role, "content": content})
+                elif isinstance(content, list):
+                    text_blocks: list[dict] = []
+                    for block in content:
+                        if not isinstance(block, dict):
+                            continue
+                        block_type = block.get("type")
+                        if block_type in {"input_text", "text"}:
+                            text_blocks.append(
+                                {"type": "text", "text": block.get("text", "")},
+                            )
+                    messages.append({"role": role, "content": text_blocks})
+            elif item.get("type") in {"input_text", "text"}:
+                messages.append({"role": "user", "content": item.get("text", "")})
+
+    system_prompt, prompt = build_prompt(messages)
+    if instructions:
+        system_prompt = f"{instructions}\n\n{system_prompt}" if system_prompt else instructions
+    return system_prompt, prompt
+
+
 # ---------------------------------------------------------------------------
 # Claude CLI command
 # ---------------------------------------------------------------------------
@@ -199,14 +237,15 @@ def build_claude_cmd(
     prompt: str,
     system_prompt: Optional[str],
     model: Optional[str],
-) -> list[str]:
+) -> tuple[list[str], str]:
+    """Return *(argv, stdin_text)*.  Prompt is always piped via stdin to
+    avoid OS ``ARG_MAX`` limits on large payloads."""
     cmd = ["claude", "-p", "--verbose", "--output-format", "stream-json"]
     if model:
         cmd.extend(["--model", model])
     if system_prompt:
         cmd.extend(["--system-prompt", system_prompt])
-    cmd.append(prompt)
-    return cmd
+    return cmd, prompt
 
 
 # ---------------------------------------------------------------------------
@@ -253,6 +292,44 @@ def make_stream_chunk(
         "created": int(time.time()),
         "model": model,
         "choices": [{"index": 0, "delta": delta, "finish_reason": finish_reason}],
+    }
+
+
+def _usage_openai_responses(usage: dict | None = None) -> dict:
+    input_tokens = (usage or {}).get("input_tokens", 0)
+    output_tokens = (usage or {}).get("output_tokens", 0)
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": input_tokens + output_tokens,
+    }
+
+
+def make_responses_response(text: str, model: str, usage: dict | None = None) -> dict:
+    response_id = f"resp_{uuid.uuid4().hex[:24]}"
+    message_id = f"msg_{uuid.uuid4().hex[:24]}"
+    return {
+        "id": response_id,
+        "object": "response",
+        "created_at": int(time.time()),
+        "status": "completed",
+        "model": model,
+        "output": [
+            {
+                "id": message_id,
+                "type": "message",
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": text,
+                        "annotations": [],
+                    }
+                ],
+            }
+        ],
+        "output_text": text,
+        "usage": _usage_openai_responses(usage),
     }
 
 
@@ -338,7 +415,7 @@ async def chat_completions(request: Request):
     stream = body.get("stream", False)
 
     system_prompt, prompt = build_prompt(messages)
-    cmd = build_claude_cmd(prompt, system_prompt, model)
+    cmd, stdin_text = build_claude_cmd(prompt, system_prompt, model)
 
     if not await _acquire_slot():
         return JSONResponse(
@@ -349,9 +426,12 @@ async def chat_completions(request: Request):
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
+            stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
+        proc.stdin.write(stdin_text.encode())
+        proc.stdin.write_eof()
     except OSError as exc:
         _release_slot()
         return JSONResponse(
@@ -429,6 +509,171 @@ async def chat_completions(request: Request):
     return JSONResponse(content=make_chat_response(result_text, model, usage))
 
 
+@app.post("/v1/responses")
+@app.post("/responses")
+async def responses(request: Request):
+    body = await request.json()
+    model = body.get("model", "sonnet")
+    stream = body.get("stream", False)
+    input_data = body.get("input", "")
+    instructions = body.get("instructions")
+
+    system_prompt, prompt = build_prompt_responses(input_data, instructions)
+    cmd, stdin_text = build_claude_cmd(prompt, system_prompt, model)
+
+    if not await _acquire_slot():
+        return JSONResponse(
+            status_code=503,
+            content={"error": {"message": "Server at capacity", "type": "capacity_error"}},
+        )
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        proc.stdin.write(stdin_text.encode())
+        proc.stdin.write_eof()
+    except OSError as exc:
+        _release_slot()
+        return JSONResponse(
+            status_code=503,
+            content={"error": {"message": f"Failed to start subprocess: {exc}", "type": "server_error"}},
+        )
+
+    _active_processes.add(proc)
+
+    if stream:
+        response_id = f"resp_{uuid.uuid4().hex[:24]}"
+        message_id = f"msg_{uuid.uuid4().hex[:24]}"
+
+        async def generate():
+            output_text = ""
+            usage = {}
+            try:
+                deadline = time.monotonic() + _request_timeout
+                yield "data: " + json.dumps({
+                    "type": "response.created",
+                    "response": {
+                        "id": response_id,
+                        "object": "response",
+                        "created_at": int(time.time()),
+                        "status": "in_progress",
+                        "model": model,
+                        "output": [],
+                        "usage": _usage_openai_responses(),
+                    },
+                }) + "\n\n"
+                async for raw in proc.stdout:
+                    if time.monotonic() > deadline:
+                        break
+                    line = raw.strip()
+                    if not line:
+                        continue
+                    try:
+                        event = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+
+                    if event.get("type") == "result":
+                        usage = event.get("usage", {})
+                        if event.get("result"):
+                            output_text = event.get("result")
+                        continue
+
+                    if event.get("type") != "stream_event":
+                        continue
+
+                    inner = event.get("event", {})
+                    if inner.get("type") == "content_block_delta":
+                        delta = inner.get("delta", {})
+                        if delta.get("type") == "text_delta":
+                            text = delta.get("text", "")
+                            if text:
+                                output_text += text
+                                yield "data: " + json.dumps({
+                                    "type": "response.output_text.delta",
+                                    "response_id": response_id,
+                                    "item_id": message_id,
+                                    "output_index": 0,
+                                    "content_index": 0,
+                                    "delta": text,
+                                }) + "\n\n"
+
+                await proc.wait()
+                yield "data: " + json.dumps({
+                    "type": "response.output_text.done",
+                    "response_id": response_id,
+                    "item_id": message_id,
+                    "output_index": 0,
+                    "content_index": 0,
+                    "text": output_text,
+                }) + "\n\n"
+
+                yield "data: " + json.dumps({
+                    "type": "response.completed",
+                    "response": {
+                        "id": response_id,
+                        "object": "response",
+                        "created_at": int(time.time()),
+                        "status": "completed",
+                        "model": model,
+                        "output": [
+                            {
+                                "id": message_id,
+                                "type": "message",
+                                "role": "assistant",
+                                "content": [
+                                    {
+                                        "type": "output_text",
+                                        "text": output_text,
+                                        "annotations": [],
+                                    }
+                                ],
+                            }
+                        ],
+                        "output_text": output_text,
+                        "usage": _usage_openai_responses(usage),
+                    },
+                }) + "\n\n"
+                yield "data: [DONE]\n\n"
+            finally:
+                await _cleanup_process(proc)
+                _release_slot()
+
+        return StreamingResponse(
+            generate(),
+            media_type="text/event-stream",
+            headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
+        )
+
+    try:
+        result_text, usage = await asyncio.wait_for(
+            _read_cli_result(proc), timeout=_request_timeout,
+        )
+    except asyncio.TimeoutError:
+        await _cleanup_process(proc)
+        _release_slot()
+        return JSONResponse(
+            status_code=504,
+            content={"error": {"message": "Request timed out", "type": "timeout_error"}},
+        )
+
+    _active_processes.discard(proc)
+    _release_slot()
+
+    if proc.returncode != 0:
+        stderr = await proc.stderr.read()
+        return JSONResponse(
+            status_code=500,
+            content={"error": {"message": f"Claude CLI error: {stderr.decode()}", "type": "server_error"}},
+        )
+
+    return JSONResponse(content=make_responses_response(result_text, model, usage))
+
+
 # ---------------------------------------------------------------------------
 # Anthropic Messages API
 # ---------------------------------------------------------------------------
@@ -444,7 +689,7 @@ async def anthropic_messages(request: Request):
     stream = body.get("stream", False)
 
     system_prompt, prompt = build_prompt_anthropic(messages, system)
-    cmd = build_claude_cmd(prompt, system_prompt, model)
+    cmd, stdin_text = build_claude_cmd(prompt, system_prompt, model)
 
     if not await _acquire_slot():
         return JSONResponse(
@@ -458,9 +703,12 @@ async def anthropic_messages(request: Request):
     try:
         proc = await asyncio.create_subprocess_exec(
             *cmd,
+            stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
+        proc.stdin.write(stdin_text.encode())
+        proc.stdin.write_eof()
     except OSError as exc:
         _release_slot()
         return JSONResponse(

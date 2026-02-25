@@ -135,6 +135,11 @@ curl http://localhost:18082/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"sonnet","messages":[{"role":"user","content":"Hello"}],"stream":true}'
 
+# OpenAI Responses format
+curl http://localhost:18082/v1/responses \
+  -H "Content-Type: application/json" \
+  -d '{"model":"sonnet","input":"Hello"}'
+
 # Anthropic format
 curl http://localhost:18082/v1/messages \
   -H "Content-Type: application/json" \
@@ -157,6 +162,7 @@ claude-relay serve [--host HOST] [--port PORT]
 | Endpoint | Method | Description |
 |---|---|---|
 | `/v1/chat/completions` | POST | Chat completions (OpenAI-compatible) |
+| `/v1/responses` | POST | Responses API (OpenAI-compatible) |
 | `/v1/messages` | POST | Messages (Anthropic-compatible) |
 | `/v1/models` | GET | List available models |
 | `/health` | GET | Server and CLI status |
