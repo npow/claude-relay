@@ -24,7 +24,7 @@ You have tools that speak the OpenAI or Anthropic API. You have Claude Code with
 uvx claude-relay serve
 
 # Or install globally
-uv pip install claude-relay
+uv tool install claude-relay
 claude-relay serve
 
 # Or from source
@@ -38,7 +38,33 @@ uv run claude-relay serve
 
 ```bash
 claude-relay serve
-# Server starts on http://localhost:8082
+# Server starts on http://localhost:18082
+```
+
+### Run as background service (macOS)
+
+```bash
+# Install and auto-start on login
+claude-relay service install
+```
+
+The installer will offer to add these to your `~/.zshrc` (or `~/.bashrc`) so every SDK and agent picks up the relay automatically:
+
+```bash
+export ANTHROPIC_BASE_URL="http://127.0.0.1:18082"
+export OPENAI_BASE_URL="http://127.0.0.1:18082/v1"
+```
+
+```bash
+# Check status
+claude-relay service status
+
+# Update
+uv tool upgrade claude-relay
+claude-relay service restart
+
+# Stop and remove
+claude-relay service uninstall
 ```
 
 Point any OpenAI-compatible client at it:
@@ -46,7 +72,7 @@ Point any OpenAI-compatible client at it:
 ```python
 from openai import OpenAI
 
-client = OpenAI(base_url="http://localhost:8082/v1", api_key="unused")
+client = OpenAI(base_url="http://localhost:18082/v1", api_key="unused")
 
 # Streaming
 for chunk in client.chat.completions.create(
@@ -70,8 +96,8 @@ print(resp.choices[0].message.content)
 import anthropic
 
 # Just set the base URL — the SDK reads ANTHROPIC_BASE_URL automatically
-# export ANTHROPIC_BASE_URL=http://localhost:8082
-client = anthropic.Anthropic(base_url="http://localhost:8082")
+# export ANTHROPIC_BASE_URL=http://localhost:18082
+client = anthropic.Anthropic(base_url="http://localhost:18082")
 
 # Streaming
 with client.messages.stream(
@@ -96,7 +122,7 @@ print(resp.content[0].text)
 ```python
 from langchain_anthropic import ChatAnthropic
 
-# export ANTHROPIC_BASE_URL=http://localhost:8082
+# export ANTHROPIC_BASE_URL=http://localhost:18082
 llm = ChatAnthropic(model="sonnet")
 print(llm.invoke("Hello!").content)
 ```
@@ -105,12 +131,12 @@ print(llm.invoke("Hello!").content)
 
 ```bash
 # OpenAI format
-curl http://localhost:8082/v1/chat/completions \
+curl http://localhost:18082/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"sonnet","messages":[{"role":"user","content":"Hello"}],"stream":true}'
 
 # Anthropic format
-curl http://localhost:8082/v1/messages \
+curl http://localhost:18082/v1/messages \
   -H "Content-Type: application/json" \
   -d '{"model":"sonnet","max_tokens":1024,"messages":[{"role":"user","content":"Hello"}]}'
 ```
@@ -124,7 +150,7 @@ claude-relay serve [--host HOST] [--port PORT]
 | Flag | Default | Description |
 |---|---|---|
 | `--host` | `0.0.0.0` | Bind address |
-| `--port` | `8082` | Bind port |
+| `--port` | `18082` | Bind port |
 
 ## API
 

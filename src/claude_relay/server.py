@@ -200,7 +200,7 @@ def build_claude_cmd(
     system_prompt: Optional[str],
     model: Optional[str],
 ) -> list[str]:
-    cmd = ["claude", "-p", "--output-format", "stream-json", "--include-partial-messages"]
+    cmd = ["claude", "-p", "--verbose", "--output-format", "stream-json"]
     if model:
         cmd.extend(["--model", model])
     if system_prompt:
