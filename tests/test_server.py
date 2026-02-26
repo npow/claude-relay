@@ -151,22 +151,32 @@ class TestBuildPrompt:
 
 class TestBuildClaudeCmd:
     def test_basic(self):
-        cmd = build_claude_cmd("Hi", None, None)
+        cmd, stdin_text = build_claude_cmd("Hi", None, None)
         assert cmd[:2] == ["claude", "-p"]
         assert "--output-format" in cmd
-        assert cmd[-1] == "Hi"
+        assert stdin_text == "Hi"
 
     def test_with_model(self):
-        cmd = build_claude_cmd("Hi", None, "opus")
+        cmd, _ = build_claude_cmd("Hi", None, "opus")
         assert cmd[cmd.index("--model") + 1] == "opus"
 
     def test_with_system_prompt(self):
-        cmd = build_claude_cmd("Hi", "Be nice", None)
+        cmd, _ = build_claude_cmd("Hi", "Be nice", None)
         assert cmd[cmd.index("--system-prompt") + 1] == "Be nice"
 
     def test_model_passthrough(self):
-        cmd = build_claude_cmd("Hi", None, "my-custom-model")
+        cmd, _ = build_claude_cmd("Hi", None, "my-custom-model")
         assert cmd[cmd.index("--model") + 1] == "my-custom-model"
+
+    def test_force_json(self):
+        cmd, _ = build_claude_cmd("Hi", None, None, force_json=True)
+        assert "--json-schema" in cmd
+        idx = cmd.index("--json-schema")
+        assert cmd[idx + 1] == '{"type": "object"}'
+
+    def test_no_force_json(self):
+        cmd, _ = build_claude_cmd("Hi", None, None, force_json=False)
+        assert "--json-schema" not in cmd
 
 
 # ---------------------------------------------------------------------------
@@ -349,7 +359,7 @@ async def test_multimodal(client):
     data = _make_claude_stream_lines(["I see"])
     proc = _mock_process(data.encode())
 
-    with patch(f"{MODULE}.asyncio.create_subprocess_exec", return_value=proc) as mock_exec:
+    with patch(f"{MODULE}.asyncio.create_subprocess_exec", return_value=proc):
         await client.post("/v1/chat/completions", json={
             "model": "sonnet",
             "messages": [{
@@ -361,8 +371,8 @@ async def test_multimodal(client):
             }],
         })
 
-    prompt_arg = mock_exec.call_args[0][-1]
-    assert prompt_arg == "What is this?"
+    stdin_written = proc.stdin.write.call_args[0][0].decode()
+    assert stdin_written == "What is this?"
 
 
 @pytest.mark.anyio
@@ -370,7 +380,7 @@ async def test_multi_turn(client):
     data = _make_claude_stream_lines(["6"])
     proc = _mock_process(data.encode())
 
-    with patch(f"{MODULE}.asyncio.create_subprocess_exec", return_value=proc) as mock_exec:
+    with patch(f"{MODULE}.asyncio.create_subprocess_exec", return_value=proc):
         await client.post("/v1/chat/completions", json={
             "model": "sonnet",
             "messages": [
@@ -380,10 +390,10 @@ async def test_multi_turn(client):
             ],
         })
 
-    prompt_arg = mock_exec.call_args[0][-1]
-    assert "User: 2+2?" in prompt_arg
-    assert "Assistant: 4" in prompt_arg
-    assert "User: 3+3?" in prompt_arg
+    stdin_written = proc.stdin.write.call_args[0][0].decode()
+    assert "User: 2+2?" in stdin_written
+    assert "Assistant: 4" in stdin_written
+    assert "User: 3+3?" in stdin_written
 
 
 @pytest.mark.anyio
@@ -407,14 +417,15 @@ async def test_response_id_format(client):
 
 class TestBuildPromptAnthropic:
     def test_single_user_message(self):
-        system, prompt = build_prompt_anthropic(
+        system, prompt, force_json = build_prompt_anthropic(
             [{"role": "user", "content": "Hello"}],
         )
         assert system is None
         assert prompt == "Hello"
+        assert force_json is False
 
     def test_system_string(self):
-        system, prompt = build_prompt_anthropic(
+        system, prompt, _ = build_prompt_anthropic(
             [{"role": "user", "content": "Hi"}],
             system="You are helpful.",
         )
@@ -422,7 +433,7 @@ class TestBuildPromptAnthropic:
         assert prompt == "Hi"
 
     def test_system_content_blocks(self):
-        system, _ = build_prompt_anthropic(
+        system, _, _ = build_prompt_anthropic(
             [{"role": "user", "content": "Hi"}],
             system=[
                 {"type": "text", "text": "Rule 1"},
@@ -432,7 +443,7 @@ class TestBuildPromptAnthropic:
         assert system == "Rule 1\n\nRule 2"
 
     def test_multi_turn(self):
-        _, prompt = build_prompt_anthropic([
+        _, prompt, _ = build_prompt_anthropic([
             {"role": "user", "content": "2+2?"},
             {"role": "assistant", "content": "4"},
             {"role": "user", "content": "3+3?"},
@@ -442,7 +453,7 @@ class TestBuildPromptAnthropic:
         assert "User: 3+3?" in prompt
 
     def test_content_array(self):
-        _, prompt = build_prompt_anthropic([{
+        _, prompt, _ = build_prompt_anthropic([{
             "role": "user",
             "content": [
                 {"type": "text", "text": "Describe this"},
@@ -452,16 +463,36 @@ class TestBuildPromptAnthropic:
         assert prompt == "Describe this"
 
     def test_empty_messages(self):
-        system, prompt = build_prompt_anthropic([])
+        system, prompt, _ = build_prompt_anthropic([])
         assert system is None
         assert prompt == ""
 
     def test_no_system(self):
-        system, _ = build_prompt_anthropic(
+        system, _, _ = build_prompt_anthropic(
             [{"role": "user", "content": "Hi"}],
             system=None,
         )
         assert system is None
+
+    def test_assistant_prefill_json(self):
+        system, prompt, force_json = build_prompt_anthropic(
+            [
+                {"role": "user", "content": "Return JSON"},
+                {"role": "assistant", "content": "{"},
+            ],
+        )
+        assert force_json is True
+        assert prompt == "Return JSON"
+        assert "Assistant" not in prompt
+
+    def test_assistant_prefill_not_triggered_for_conversation(self):
+        _, prompt, force_json = build_prompt_anthropic([
+            {"role": "user", "content": "2+2?"},
+            {"role": "assistant", "content": "4"},
+            {"role": "user", "content": "3+3?"},
+        ])
+        assert force_json is False
+        assert "Assistant: 4" in prompt
 
 
 class TestBuildPromptResponses:
@@ -686,7 +717,7 @@ async def test_anthropic_multi_turn(client):
     data = _make_claude_stream_lines(["6"])
     proc = _mock_process(data.encode())
 
-    with patch(f"{MODULE}.asyncio.create_subprocess_exec", return_value=proc) as mock_exec:
+    with patch(f"{MODULE}.asyncio.create_subprocess_exec", return_value=proc):
         await client.post("/v1/messages", json={
             "model": "sonnet",
             "max_tokens": 1024,
@@ -697,10 +728,10 @@ async def test_anthropic_multi_turn(client):
             ],
         })
 
-    prompt_arg = mock_exec.call_args[0][-1]
-    assert "User: 2+2?" in prompt_arg
-    assert "Assistant: 4" in prompt_arg
-    assert "User: 3+3?" in prompt_arg
+    stdin_written = proc.stdin.write.call_args[0][0].decode()
+    assert "User: 2+2?" in stdin_written
+    assert "Assistant: 4" in stdin_written
+    assert "User: 3+3?" in stdin_written
 
 
 @pytest.mark.anyio
@@ -735,7 +766,7 @@ async def test_anthropic_content_array(client):
     data = _make_claude_stream_lines(["I see"])
     proc = _mock_process(data.encode())
 
-    with patch(f"{MODULE}.asyncio.create_subprocess_exec", return_value=proc) as mock_exec:
+    with patch(f"{MODULE}.asyncio.create_subprocess_exec", return_value=proc):
         await client.post("/v1/messages", json={
             "model": "sonnet",
             "max_tokens": 1024,
@@ -748,8 +779,8 @@ async def test_anthropic_content_array(client):
             }],
         })
 
-    prompt_arg = mock_exec.call_args[0][-1]
-    assert prompt_arg == "What is this?"
+    stdin_written = proc.stdin.write.call_args[0][0].decode()
+    assert stdin_written == "What is this?"
 
 
 # ---------------------------------------------------------------------------

@@ -146,13 +146,17 @@ def build_prompt(messages: list[dict]) -> tuple[Optional[str], str]:
 def build_prompt_anthropic(
     messages: list[dict],
     system: str | list[dict] | None = None,
-) -> tuple[Optional[str], str]:
-    """Convert Anthropic message format to (system_prompt, user_prompt).
+) -> tuple[Optional[str], str, bool]:
+    """Convert Anthropic message format to (system_prompt, user_prompt, force_json).
 
     Anthropic passes ``system`` as a top-level field (string or list of
     content blocks), not inside the messages array.  Messages use the same
     role/content structure but content can be ``str`` or
     ``list[{type, text}]``.
+
+    When the last message is an assistant prefill (short content like ``{``),
+    it is stripped from the conversation and ``force_json=True`` is returned
+    so the caller can pass ``--json-schema`` to ``claude -p``.
     """
     # Build system prompt from the top-level system field.
     if isinstance(system, list):
@@ -170,8 +174,17 @@ def build_prompt_anthropic(
             return "\n".join(c["text"] for c in content if c.get("type") == "text")
         return content or ""
 
+    # Detect assistant prefill: last message is assistant with short content
+    force_json = False
+    working_messages = list(messages)
+    if working_messages and working_messages[-1].get("role") == "assistant":
+        prefill = _text(working_messages[-1].get("content", "")).strip()
+        if prefill in ("{", "[", '{"'):
+            force_json = True
+            working_messages = working_messages[:-1]
+
     conversation_parts: list[str] = []
-    for msg in messages:
+    for msg in working_messages:
         role = msg.get("role", "user")
         text = _text(msg.get("content", ""))
         if role == "user":
@@ -179,15 +192,15 @@ def build_prompt_anthropic(
         elif role == "assistant":
             conversation_parts.append(f"Assistant: {text}")
 
-    user_msgs = [m for m in messages if m.get("role") == "user"]
-    asst_msgs = [m for m in messages if m.get("role") == "assistant"]
+    user_msgs = [m for m in working_messages if m.get("role") == "user"]
+    asst_msgs = [m for m in working_messages if m.get("role") == "assistant"]
 
     if len(user_msgs) == 1 and not asst_msgs:
         prompt = _text(user_msgs[0].get("content", ""))
     else:
         prompt = "\n\n".join(conversation_parts)
 
-    return system_prompt or None, prompt
+    return system_prompt or None, prompt, force_json
 
 
 def build_prompt_responses(
@@ -237,6 +250,7 @@ def build_claude_cmd(
     prompt: str,
     system_prompt: Optional[str],
     model: Optional[str],
+    force_json: bool = False,
 ) -> tuple[list[str], str]:
     """Return *(argv, stdin_text)*.  Prompt is always piped via stdin to
     avoid OS ``ARG_MAX`` limits on large payloads."""
@@ -245,6 +259,8 @@ def build_claude_cmd(
         cmd.extend(["--model", model])
     if system_prompt:
         cmd.extend(["--system-prompt", system_prompt])
+    if force_json:
+        cmd.extend(["--json-schema", '{"type": "object"}'])
     return cmd, prompt
 
 
@@ -688,8 +704,8 @@ async def anthropic_messages(request: Request):
     system = body.get("system")
     stream = body.get("stream", False)
 
-    system_prompt, prompt = build_prompt_anthropic(messages, system)
-    cmd, stdin_text = build_claude_cmd(prompt, system_prompt, model)
+    system_prompt, prompt, force_json = build_prompt_anthropic(messages, system)
+    cmd, stdin_text = build_claude_cmd(prompt, system_prompt, model, force_json=force_json)
 
     if not await _acquire_slot():
         return JSONResponse(
