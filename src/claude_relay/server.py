@@ -257,10 +257,16 @@ def build_claude_cmd(
     cmd = ["claude", "-p", "--verbose", "--output-format", "stream-json"]
     if model:
         cmd.extend(["--model", model])
-    if system_prompt:
-        cmd.extend(["--system-prompt", system_prompt])
+    effective_system = system_prompt or ""
     if force_json:
-        cmd.extend(["--json-schema", '{"type": "object"}'])
+        json_instruction = (
+            "\n\nCRITICAL: Your ENTIRE response must be a single valid JSON object. "
+            "Start with { and end with }. No markdown, no code blocks, no prose before or after. "
+            "Just raw JSON."
+        )
+        effective_system = (effective_system + json_instruction).strip()
+    if effective_system:
+        cmd.extend(["--system-prompt", effective_system])
     return cmd, prompt
 
 

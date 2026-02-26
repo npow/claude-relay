@@ -170,13 +170,22 @@ class TestBuildClaudeCmd:
 
     def test_force_json(self):
         cmd, _ = build_claude_cmd("Hi", None, None, force_json=True)
-        assert "--json-schema" in cmd
-        idx = cmd.index("--json-schema")
-        assert cmd[idx + 1] == '{"type": "object"}'
+        idx = cmd.index("--system-prompt")
+        system = cmd[idx + 1]
+        assert "CRITICAL" in system
+        assert "valid JSON object" in system
+
+    def test_force_json_appends_to_system(self):
+        cmd, _ = build_claude_cmd("Hi", "Be helpful.", None, force_json=True)
+        idx = cmd.index("--system-prompt")
+        system = cmd[idx + 1]
+        assert system.startswith("Be helpful.")
+        assert "valid JSON object" in system
 
     def test_no_force_json(self):
         cmd, _ = build_claude_cmd("Hi", None, None, force_json=False)
-        assert "--json-schema" not in cmd
+        # No system prompt should be added when force_json is False and no system_prompt given
+        assert "--system-prompt" not in cmd
 
 
 # ---------------------------------------------------------------------------
