@@ -1,6 +1,6 @@
 [project]
 name = "claude-relay"
-version = "0.3.0"
+version = "0.4.0"
 description = "OpenAI- and Anthropic-compatible API server that routes through Claude Code"
 readme = "README.md"
 license = {text = "MIT"}
