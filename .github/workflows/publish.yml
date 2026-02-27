@@ -11,6 +11,7 @@ permissions:
 jobs:
   publish-agentrelay-cli:
     runs-on: ubuntu-latest
+    environment: pypi
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
@@ -20,6 +21,7 @@ jobs:
   publish-claude-relay-compat:
     runs-on: ubuntu-latest
     needs: publish-agentrelay-cli
+    environment: pypi
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
