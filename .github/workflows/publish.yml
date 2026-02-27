@@ -44,20 +44,20 @@ jobs:
 
           (compat_root / "pyproject.toml").write_text(
               f'''[project]
-name = "claude-relay"
-version = "{version}"
-description = "Compatibility package; use agent-relay"
-readme = "README.md"
-requires-python = ">=3.10"
-dependencies = ["agent-relay=={version}"]
+              name = "claude-relay"
+              version = "{version}"
+              description = "Compatibility package; use agent-relay"
+              readme = "README.md"
+              requires-python = ">=3.10"
+              dependencies = ["agent-relay=={version}"]
 
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+              [build-system]
+              requires = ["hatchling"]
+              build-backend = "hatchling.build"
 
-[tool.hatch.build.targets.wheel]
-packages = ["src/claude_relay_compat"]
-'''
+              [tool.hatch.build.targets.wheel]
+              packages = ["src/claude_relay_compat"]
+              '''
           )
           PY
           uv build compat/claude-relay --out-dir compat/claude-relay/dist
