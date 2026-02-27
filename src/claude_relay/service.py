@@ -1,4 +1,4 @@
-"""macOS launchd service management for claude-relay."""
+"""macOS launchd service management for agent-relay."""
 
 import os
 import platform
@@ -7,7 +7,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-LABEL = "com.claude-relay.server"
+LABEL = "com.agent-relay.server"
+LEGACY_LABEL = "com.claude-relay.server"
 
 
 def _plist_path() -> Path:
@@ -15,21 +16,21 @@ def _plist_path() -> Path:
 
 
 def _find_executable() -> str:
-    """Find the claude-relay executable path."""
-    exe = shutil.which("claude-relay")
+    """Find the relay executable path."""
+    exe = shutil.which("agent-relay") or shutil.which("claude-relay")
     if exe:
         return exe
     # Fallback: use the Python that's running us + module invocation.
     return sys.executable
 
 
-def _generate_plist(host: str, port: int) -> str:
+def _generate_plist(host: str, port: int, backend: str = "claude") -> str:
     exe = _find_executable()
-    log_dir = Path.home() / "Library" / "Logs" / "claude-relay"
+    log_dir = Path.home() / "Library" / "Logs" / "agent-relay"
 
     # If we found the actual claude-relay binary, use it directly.
     # Otherwise, invoke via python -m.
-    if exe.endswith("claude-relay"):
+    if exe.endswith("agent-relay") or exe.endswith("claude-relay"):
         program_args = f"""\
     <array>
         <string>{exe}</string>
@@ -38,6 +39,8 @@ def _generate_plist(host: str, port: int) -> str:
         <string>{port}</string>
         <string>--host</string>
         <string>{host}</string>
+        <string>--backend</string>
+        <string>{backend}</string>
         <string>--workers</string>
         <string>1</string>
     </array>"""
@@ -78,6 +81,8 @@ def _generate_plist(host: str, port: int) -> str:
     <dict>
         <key>PATH</key>
         <string>{os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")}</string>
+        <key>AGENT_RELAY_BACKEND</key>
+        <string>{backend}</string>
     </dict>
 </dict>
 </plist>
@@ -105,7 +110,7 @@ def _setup_env(host: str, port: int) -> None:
     """Offer to append SDK env vars to the user's shell rc file."""
     lines = _env_lines(host, port)
     rc = _shell_rc()
-    marker = "# claude-relay"
+    marker = "# agent-relay"
 
     # Check if already present.
     if rc.exists() and marker in rc.read_text():
@@ -135,13 +140,13 @@ def _setup_env(host: str, port: int) -> None:
         print("  Skipped. You can add them manually later.")
 
 
-def service_install(host: str, port: int) -> None:
+def service_install(host: str, port: int, backend: str = "claude") -> None:
     if platform.system() != "Darwin":
         print("Error: service management is only supported on macOS.", file=sys.stderr)
         sys.exit(1)
 
     plist = _plist_path()
-    log_dir = Path.home() / "Library" / "Logs" / "claude-relay"
+    log_dir = Path.home() / "Library" / "Logs" / "agent-relay"
     log_dir.mkdir(parents=True, exist_ok=True)
 
     # Unload existing service if present.
@@ -149,7 +154,7 @@ def service_install(host: str, port: int) -> None:
         subprocess.run(["launchctl", "unload", str(plist)], capture_output=True)
 
     plist.parent.mkdir(parents=True, exist_ok=True)
-    plist.write_text(_generate_plist(host, port))
+    plist.write_text(_generate_plist(host, port, backend=backend))
 
     subprocess.run(["launchctl", "load", str(plist)], check=True)
     print(f"Service installed and started.")
@@ -161,7 +166,7 @@ def service_install(host: str, port: int) -> None:
 
     print()
     print("The service will auto-start on login. To stop it:")
-    print("  claude-relay service uninstall")
+    print("  agent-relay service uninstall")
 
 
 def service_restart() -> None:
@@ -171,7 +176,7 @@ def service_restart() -> None:
 
     plist = _plist_path()
     if not plist.exists():
-        print("Service is not installed. Run: claude-relay service install")
+        print("Service is not installed. Run: agent-relay service install")
         sys.exit(1)
 
     subprocess.run(["launchctl", "unload", str(plist)], capture_output=True)
@@ -191,6 +196,10 @@ def service_uninstall() -> None:
 
     subprocess.run(["launchctl", "unload", str(plist)], capture_output=True)
     plist.unlink()
+    legacy = Path.home() / "Library" / "LaunchAgents" / f"{LEGACY_LABEL}.plist"
+    if legacy.exists():
+        subprocess.run(["launchctl", "unload", str(legacy)], capture_output=True)
+        legacy.unlink()
     print("Service stopped and removed.")
 
 
@@ -202,7 +211,7 @@ def service_status() -> None:
     plist = _plist_path()
     if not plist.exists():
         print("Service is not installed.")
-        print(f"  Run: claude-relay service install")
+        print(f"  Run: agent-relay service install")
         return
 
     result = subprocess.run(
@@ -220,5 +229,5 @@ def service_status() -> None:
         print("Service is installed but not running.")
 
     print(f"  Plist: {plist}")
-    log_dir = Path.home() / "Library" / "Logs" / "claude-relay"
+    log_dir = Path.home() / "Library" / "Logs" / "agent-relay"
     print(f"  Logs:  {log_dir}/")

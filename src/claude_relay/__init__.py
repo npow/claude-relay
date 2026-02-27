@@ -1,3 +1,3 @@
-"""claude-relay: OpenAI- and Anthropic-compatible API server that routes through Claude Code."""
+"""agent-relay: OpenAI- and Anthropic-compatible API server for agent CLIs."""
 
-__version__ = "0.3.0"
+__version__ = "0.5.0"

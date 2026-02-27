@@ -1,4 +1,4 @@
-# AGENTS.md — Claude-Relay
+# AGENTS.md — Agent Relay
 
 ## What this is
 
@@ -10,11 +10,11 @@ Drop-in OpenAI & Anthropic API-compatible server that routes requests through `c
 
 ```bash
 # Install and run
-uvx claude-relay serve
+uvx agent-relay serve
 
 # Or from source
 git clone https://github.com/npow/claude-relay.git
-cd claude-relay && uv sync && uv run claude-relay serve
+cd claude-relay && uv sync && uv run agent-relay serve
 ```
 
 Default: `http://0.0.0.0:8082`. Override with `--host` / `--port`.

@@ -1,15 +1,17 @@
-# claude-relay
+# agent-relay
 
 [![CI](https://github.com/npow/claude-relay/actions/workflows/ci.yml/badge.svg)](https://github.com/npow/claude-relay/actions/workflows/ci.yml)
-[![PyPI](https://img.shields.io/pypi/v/claude-relay)](https://pypi.org/project/claude-relay/)
+[![PyPI](https://img.shields.io/pypi/v/agent-relay)](https://pypi.org/project/agent-relay/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
-Drop-in OpenAI **and Anthropic** API server that routes through [Claude Code](https://docs.anthropic.com/en/docs/claude-code).
+Drop-in OpenAI **and Anthropic** API server that routes through agent CLIs (currently [Claude Code](https://docs.anthropic.com/en/docs/claude-code)).
+
+> Compatibility note: `claude-relay` remains available as a compatibility package/command alias.
 
 ## Why
 
-You have tools that speak the OpenAI or Anthropic API. You have Claude Code with its tools, MCP servers, and agentic capabilities. **claude-relay** bridges the two — point any compatible client at it and every request flows through `claude -p` under the hood.
+You have tools that speak the OpenAI or Anthropic API. You have Claude Code with its tools, MCP servers, and agentic capabilities. **agent-relay** bridges the two — point any compatible client at it and every request flows through `claude -p` under the hood.
 
 - **Use Claude Code from any OpenAI or Anthropic client** — Cursor, Continue, aider, LangChain, custom scripts
 - **Keep Claude Code's superpowers** — tool use, MCP servers, file access, shell execution
@@ -21,23 +23,23 @@ You have tools that speak the OpenAI or Anthropic API. You have Claude Code with
 
 ```bash
 # With uv (recommended)
-uvx claude-relay serve
+uvx agent-relay serve
 
 # Or install globally
-uv tool install claude-relay
-claude-relay serve
+uv tool install agent-relay
+agent-relay serve
 
 # Or from source
 git clone https://github.com/npow/claude-relay.git
 cd claude-relay
 uv sync
-uv run claude-relay serve
+uv run agent-relay serve
 ```
 
 ## Quick start
 
 ```bash
-claude-relay serve
+agent-relay serve
 # Server starts on http://localhost:18082
 ```
 
@@ -45,7 +47,7 @@ claude-relay serve
 
 ```bash
 # Install and auto-start on login
-claude-relay service install
+agent-relay service install
 ```
 
 The installer will offer to add these to your `~/.zshrc` (or `~/.bashrc`) so every SDK and agent picks up the relay automatically:
@@ -57,14 +59,14 @@ export OPENAI_BASE_URL="http://127.0.0.1:18082/v1"
 
 ```bash
 # Check status
-claude-relay service status
+agent-relay service status
 
 # Update
-uv tool upgrade claude-relay
-claude-relay service restart
+uv tool upgrade agent-relay
+agent-relay service restart
 
 # Stop and remove
-claude-relay service uninstall
+agent-relay service uninstall
 ```
 
 Point any OpenAI-compatible client at it:
@@ -149,7 +151,7 @@ curl http://localhost:18082/v1/messages \
 ## Configuration
 
 ```
-claude-relay serve [--host HOST] [--port PORT]
+agent-relay serve [--host HOST] [--port PORT]
 ```
 
 | Flag | Default | Description |

@@ -88,7 +88,7 @@ async def _lifespan(_app: FastAPI):
     _active_processes.clear()
 
 
-app = FastAPI(title="claude-relay", version=__version__, lifespan=_lifespan)
+app = FastAPI(title="agent-relay", version=__version__, lifespan=_lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -412,10 +412,14 @@ async def _read_cli_result(proc) -> tuple[str, dict]:
 
 @app.get("/health")
 async def health():
+    backend = os.environ.get("AGENT_RELAY_BACKEND", "claude")
     cli_found = shutil.which("claude") is not None
+    if backend == "codex":
+        cli_found = shutil.which("codex") is not None
     return {
         "status": "ok" if cli_found else "degraded",
         "version": __version__,
+        "backend": backend,
         "claude_cli": cli_found,
         "active_requests": _active_count,
         "max_concurrent": _max_concurrent,

@@ -9,10 +9,58 @@ permissions:
   id-token: write
 
 jobs:
-  publish:
+  publish-agent-relay:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
       - run: uv build
       - uses: pypa/gh-action-pypi-publish@release/v1
+
+  publish-claude-relay-compat:
+    runs-on: ubuntu-latest
+    needs: publish-agent-relay
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - name: Build compatibility package
+        run: |
+          python - <<'PY'
+          import pathlib
+          import tomllib
+
+          root = pathlib.Path(".")
+          version = tomllib.loads((root / "pyproject.toml").read_text())["project"]["version"]
+
+          compat_root = root / "compat" / "claude-relay"
+          pkg_dir = compat_root / "src" / "claude_relay_compat"
+          pkg_dir.mkdir(parents=True, exist_ok=True)
+          (pkg_dir / "__init__.py").write_text('__all__ = ["__version__"]\n__version__ = "' + version + '"\n')
+
+          (compat_root / "README.md").write_text(
+              "# claude-relay (compatibility package)\n\n"
+              "Deprecated compatibility package. Install `agent-relay` for canonical updates.\n"
+          )
+
+          (compat_root / "pyproject.toml").write_text(
+              f'''[project]
+name = "claude-relay"
+version = "{version}"
+description = "Compatibility package; use agent-relay"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["agent-relay=={version}"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/claude_relay_compat"]
+'''
+          )
+          PY
+          uv build compat/claude-relay --out-dir compat/claude-relay/dist
+      - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: compat/claude-relay/dist
