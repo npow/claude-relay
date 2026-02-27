@@ -1,6 +1,6 @@
 [project]
-name = "agent-relay"
-version = "0.5.0"
+name = "agentrelay-cli"
+version = "0.5.1"
 description = "OpenAI- and Anthropic-compatible API server that routes through agent CLIs"
 readme = "README.md"
 license = {text = "MIT"}

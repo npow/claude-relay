@@ -1,7 +1,7 @@
 # agent-relay
 
 [![CI](https://github.com/npow/claude-relay/actions/workflows/ci.yml/badge.svg)](https://github.com/npow/claude-relay/actions/workflows/ci.yml)
-[![PyPI](https://img.shields.io/pypi/v/agent-relay)](https://pypi.org/project/agent-relay/)
+[![PyPI](https://img.shields.io/pypi/v/agentrelay-cli)](https://pypi.org/project/agentrelay-cli/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
@@ -26,7 +26,7 @@ You have tools that speak the OpenAI or Anthropic API. You have Claude Code with
 uvx agent-relay serve
 
 # Or install globally
-uv tool install agent-relay
+uv tool install agentrelay-cli
 agent-relay serve
 
 # Or from source
@@ -62,7 +62,7 @@ export OPENAI_BASE_URL="http://127.0.0.1:18082/v1"
 agent-relay service status
 
 # Update
-uv tool upgrade agent-relay
+uv tool upgrade agentrelay-cli
 agent-relay service restart
 
 # Stop and remove

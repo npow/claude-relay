@@ -9,7 +9,7 @@ permissions:
   id-token: write
 
 jobs:
-  publish-agent-relay:
+  publish-agentrelay-cli:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -19,7 +19,7 @@ jobs:
 
   publish-claude-relay-compat:
     runs-on: ubuntu-latest
-    needs: publish-agent-relay
+    needs: publish-agentrelay-cli
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
@@ -39,17 +39,17 @@ jobs:
 
           (compat_root / "README.md").write_text(
               "# claude-relay (compatibility package)\n\n"
-              "Deprecated compatibility package. Install `agent-relay` for canonical updates.\n"
+              "Deprecated compatibility package. Install `agentrelay-cli` for canonical updates.\n"
           )
 
           (compat_root / "pyproject.toml").write_text(
               f'''[project]
               name = "claude-relay"
               version = "{version}"
-              description = "Compatibility package; use agent-relay"
+              description = "Compatibility package; use agentrelay-cli"
               readme = "README.md"
               requires-python = ">=3.10"
-              dependencies = ["agent-relay=={version}"]
+              dependencies = ["agentrelay-cli=={version}"]
 
               [build-system]
               requires = ["hatchling"]
