@@ -254,7 +254,7 @@ def build_claude_cmd(
 ) -> tuple[list[str], str]:
     """Return *(argv, stdin_text)*.  Prompt is always piped via stdin to
     avoid OS ``ARG_MAX`` limits on large payloads."""
-    cmd = ["claude", "-p", "--verbose", "--output-format", "stream-json"]
+    cmd = ["claude", "-p", "--output-format", "stream-json", "--verbose", "--include-partial-messages", "--dangerously-skip-permissions"]
     if model:
         cmd.extend(["--model", model])
     effective_system = system_prompt or ""
@@ -455,6 +455,8 @@ async def chat_completions(request: Request):
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            cwd=os.environ.get("CLAUDE_RELAY_CWD", None),
+            env={k: v for k, v in os.environ.items() if k != "CLAUDECODE"},
         )
         proc.stdin.write(stdin_text.encode())
         proc.stdin.write_eof()
@@ -559,6 +561,7 @@ async def responses(request: Request):
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env={k: v for k, v in os.environ.items() if k != "CLAUDECODE"},
         )
         proc.stdin.write(stdin_text.encode())
         proc.stdin.write_eof()
@@ -732,6 +735,8 @@ async def anthropic_messages(request: Request):
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            cwd=os.environ.get("CLAUDE_RELAY_CWD", None),
+            env={k: v for k, v in os.environ.items() if k != "CLAUDECODE"},
         )
         proc.stdin.write(stdin_text.encode())
         proc.stdin.write_eof()
