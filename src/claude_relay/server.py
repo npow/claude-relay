@@ -40,6 +40,8 @@ except ImportError:  # pragma: no cover - optional dependency
 _max_concurrent: int = int(os.environ.get("CLAUDE_RELAY_MAX_CONCURRENT", "10"))
 _request_timeout: float = float(os.environ.get("CLAUDE_RELAY_REQUEST_TIMEOUT", "300"))
 _active_processes: set = set()
+# Environment for child claude processes — strip relay URL vars to prevent recursive loops
+_subprocess_env: dict = {k: v for k, v in os.environ.items() if k not in ("ANTHROPIC_BASE_URL", "OPENAI_BASE_URL", "CLAUDECODE")}
 _active_count: int = 0
 _semaphore: asyncio.Semaphore = asyncio.Semaphore(_max_concurrent)
 _started_at: float = time.time()
@@ -777,7 +779,7 @@ async def chat_completions(request: Request):
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=os.environ.get("CLAUDE_RELAY_CWD", None),
-            env={k: v for k, v in os.environ.items() if k != "CLAUDECODE"},
+            env=_subprocess_env,
         )
         proc.stdin.write(stdin_text.encode())
         proc.stdin.write_eof()
@@ -920,7 +922,7 @@ async def responses(request: Request):
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env={k: v for k, v in os.environ.items() if k != "CLAUDECODE"},
+            env=_subprocess_env,
         )
         proc.stdin.write(stdin_text.encode())
         proc.stdin.write_eof()
@@ -1131,7 +1133,7 @@ async def anthropic_messages(request: Request):
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=os.environ.get("CLAUDE_RELAY_CWD", None),
-            env={k: v for k, v in os.environ.items() if k != "CLAUDECODE"},
+            env=_subprocess_env,
         )
         proc.stdin.write(stdin_text.encode())
         proc.stdin.write_eof()
