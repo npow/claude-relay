@@ -1,10 +1,16 @@
 """OpenAI- and Anthropic-compatible API proxy that routes requests through Claude Code CLI."""
 
 import asyncio
+import contextvars
+import hashlib
 import json
+import logging
 import os
+import re
 import shutil
 import time
+import urllib.error
+import urllib.request
 import uuid
 from contextlib import asynccontextmanager as _acm
 from typing import Optional
@@ -15,6 +21,18 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from . import __version__
 
+try:
+    import sentry_sdk
+    from sentry_sdk.integrations.logging import LoggingIntegration
+except ImportError:  # pragma: no cover - optional dependency
+    sentry_sdk = None
+    LoggingIntegration = None
+
+try:
+    from logtail import LogtailHandler
+except ImportError:  # pragma: no cover - optional dependency
+    LogtailHandler = None
+
 # ---------------------------------------------------------------------------
 # Concurrency & lifecycle state
 # ---------------------------------------------------------------------------
@@ -24,6 +42,112 @@ _request_timeout: float = float(os.environ.get("CLAUDE_RELAY_REQUEST_TIMEOUT", "
 _active_processes: set = set()
 _active_count: int = 0
 _semaphore: asyncio.Semaphore = asyncio.Semaphore(_max_concurrent)
+_started_at: float = time.time()
+_request_id_var: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "request_id", default="-",
+)
+
+
+class _RequestIdFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:  # pragma: no cover - trivial
+        record.request_id = _request_id_var.get("-")
+        return True
+
+
+def _configure_logging() -> None:
+    level_name = os.environ.get("AGENT_RELAY_LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    root = logging.getLogger()
+    if not root.handlers:
+        logging.basicConfig(
+            level=level,
+            format=(
+                "%(asctime)s %(levelname)s %(name)s "
+                "request_id=%(request_id)s %(message)s"
+            ),
+        )
+    root.setLevel(level)
+    request_filter = _RequestIdFilter()
+    for handler in root.handlers:
+        handler.addFilter(request_filter)
+
+
+_configure_logging()
+logger = logging.getLogger("claude_relay.server")
+
+
+def _init_betterstack() -> None:
+    source_token = os.environ.get("BETTERSTACK_SOURCE_TOKEN")
+    if not source_token:
+        return
+    if LogtailHandler is None:
+        logger.warning("BETTERSTACK_SOURCE_TOKEN is set but logtail-python is not installed")
+        return
+    host = os.environ.get("BETTERSTACK_INGESTING_HOST", "https://in.logs.betterstack.com")
+    if not host.startswith("http://") and not host.startswith("https://"):
+        host = f"https://{host}"
+    handler = LogtailHandler(source_token=source_token, host=host)
+    handler.setLevel(getattr(logging, os.environ.get("BETTERSTACK_LOG_LEVEL", "INFO").upper(), logging.INFO))
+    logging.getLogger().addHandler(handler)
+    logger.info("Better Stack logging initialized host=%s", host)
+
+
+def _init_sentry() -> None:
+    dsn = os.environ.get("SENTRY_DSN")
+    if not dsn:
+        return
+    if sentry_sdk is None:
+        logger.warning("SENTRY_DSN is set but sentry-sdk is not installed")
+        return
+    sentry_log_level_name = os.environ.get("SENTRY_LOG_LEVEL", "INFO").upper()
+    sentry_event_level_name = os.environ.get("SENTRY_EVENT_LEVEL", "ERROR").upper()
+    sentry_log_level = getattr(logging, sentry_log_level_name, logging.INFO)
+    sentry_event_level = getattr(logging, sentry_event_level_name, logging.ERROR)
+    integrations = []
+    if LoggingIntegration is not None:
+        integrations.append(
+            LoggingIntegration(level=sentry_log_level, event_level=sentry_event_level),
+        )
+    sentry_sdk.init(
+        dsn=dsn,
+        traces_sample_rate=float(os.environ.get("SENTRY_TRACES_SAMPLE_RATE", "0.0")),
+        environment=os.environ.get("SENTRY_ENVIRONMENT"),
+        release=f"agent-relay@{__version__}",
+        integrations=integrations,
+    )
+    logger.info(
+        "Sentry initialized log_level=%s event_level=%s",
+        sentry_log_level_name,
+        sentry_event_level_name,
+    )
+
+
+_init_sentry()
+_init_betterstack()
+
+_stats: dict[str, int] = {
+    "requests_total": 0,
+    "timeouts_total": 0,
+    "capacity_rejections_total": 0,
+    "subprocess_start_failures_total": 0,
+    "subprocess_errors_total": 0,
+    "uncaught_exceptions_total": 0,
+}
+_smart_routing_enabled: bool = os.environ.get("AGENT_RELAY_SMART_ROUTING", "false").lower() in {"1", "true", "yes", "on"}
+_smart_routing_force: bool = os.environ.get("AGENT_RELAY_SMART_ROUTING_FORCE", "false").lower() in {"1", "true", "yes", "on"}
+_routing_default_model: str = os.environ.get("AGENT_RELAY_ROUTING_DEFAULT_MODEL", "sonnet")
+_routing_tier_models: dict[str, str] = {
+    "SIMPLE": os.environ.get("AGENT_RELAY_ROUTE_MODEL_SIMPLE", "haiku"),
+    "MEDIUM": os.environ.get("AGENT_RELAY_ROUTE_MODEL_MEDIUM", "sonnet"),
+    "COMPLEX": os.environ.get("AGENT_RELAY_ROUTE_MODEL_COMPLEX", "opus"),
+    "REASONING": os.environ.get("AGENT_RELAY_ROUTE_MODEL_REASONING", "opus"),
+}
+_routing_classifier_backend: str = os.environ.get("AGENT_RELAY_ROUTING_CLASSIFIER_BACKEND", "ollama").lower()
+_routing_classifier_model: str = os.environ.get("AGENT_RELAY_ROUTING_CLASSIFIER_MODEL", "qwen2.5:3b")
+_routing_classifier_url: str = os.environ.get("AGENT_RELAY_ROUTING_CLASSIFIER_URL", "http://127.0.0.1:11434/api/chat")
+_routing_classifier_timeout: float = float(os.environ.get("AGENT_RELAY_ROUTING_CLASSIFIER_TIMEOUT", "2.0"))
+_routing_classifier_cache_ttl: int = int(os.environ.get("AGENT_RELAY_ROUTING_CLASSIFIER_CACHE_TTL", "600"))
+_routing_classifier_cache: dict[str, tuple[float, dict]] = {}
 
 
 def configure(max_concurrent: int = 10, request_timeout: float = 300.0) -> None:
@@ -33,6 +157,124 @@ def configure(max_concurrent: int = 10, request_timeout: float = 300.0) -> None:
     _request_timeout = request_timeout
     _active_count = 0
     _semaphore = asyncio.Semaphore(max_concurrent)
+    _stats.update({
+        "requests_total": 0,
+        "timeouts_total": 0,
+        "capacity_rejections_total": 0,
+        "subprocess_start_failures_total": 0,
+        "subprocess_errors_total": 0,
+        "uncaught_exceptions_total": 0,
+        "routing_failures_total": 0,
+    })
+
+
+def _extract_tier(text: str) -> str:
+    m = re.search(r"\b(SIMPLE|MEDIUM|COMPLEX|REASONING)\b", text.upper())
+    if not m:
+        raise ValueError(f"Classifier response missing tier label: {text[:120]}")
+    return m.group(1)
+
+
+def _classify_tier_ollama(prompt: str, message_count: int, structured_output: bool) -> dict:
+    cache_key = hashlib.sha256(
+        f"{prompt}|{message_count}|{int(structured_output)}|{_routing_classifier_model}".encode(),
+    ).hexdigest()
+    now = time.time()
+    cached = _routing_classifier_cache.get(cache_key)
+    if cached and (now - cached[0]) <= _routing_classifier_cache_ttl:
+        return cached[1]
+
+    classifier_prompt = (
+        "Classify the user request into exactly one tier for model routing.\n"
+        "Return only one word: SIMPLE, MEDIUM, COMPLEX, or REASONING.\n"
+        "Use REASONING for formal proofs/multi-step logical derivations.\n"
+        "Use COMPLEX for hard coding/system design/debug tasks.\n"
+        "Use MEDIUM for normal coding and analytical tasks.\n"
+        "Use SIMPLE for short factual/basic chat tasks.\n"
+        f"Message count: {message_count}\n"
+        f"Structured output required: {'yes' if structured_output else 'no'}\n\n"
+        f"User prompt:\n{prompt[:6000]}"
+    )
+    payload = json.dumps(
+        {
+            "model": _routing_classifier_model,
+            "stream": False,
+            "messages": [
+                {"role": "system", "content": "You are a strict router classifier."},
+                {"role": "user", "content": classifier_prompt},
+            ],
+            "options": {"temperature": 0},
+        },
+    ).encode()
+    req = urllib.request.Request(
+        _routing_classifier_url,
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=_routing_classifier_timeout) as resp:
+            body = json.loads(resp.read().decode())
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"Routing classifier unavailable: {exc}") from exc
+    except TimeoutError as exc:
+        raise RuntimeError("Routing classifier timed out") from exc
+
+    text = (
+        (body.get("message") or {}).get("content")
+        or body.get("response")
+        or ""
+    )
+    tier = _extract_tier(text)
+    result = {
+        "tier": tier,
+        "model": _routing_tier_models.get(tier, "sonnet"),
+        "confidence": None,
+        "signals": ["llm_classifier"],
+        "backend": _routing_classifier_backend,
+    }
+    _routing_classifier_cache[cache_key] = (now, result)
+    return result
+
+
+def _select_model(
+    requested_model: str | None,
+    prompt: str,
+    message_count: int = 1,
+    structured_output: bool = False,
+) -> tuple[str, bool]:
+    """Select model based on request + routing config. Returns (model, routed)."""
+    requested = (requested_model or "").strip()
+    if not requested:
+        requested = _routing_default_model
+    should_route = (
+        requested == "auto"
+        or (_smart_routing_enabled and requested == _routing_default_model)
+        or _smart_routing_force
+    )
+    if not should_route:
+        return requested, False
+    if _routing_classifier_backend != "ollama":
+        raise RuntimeError(
+            f"Unsupported routing classifier backend: {_routing_classifier_backend}",
+        )
+    reasons = _classify_tier_ollama(
+        prompt=prompt,
+        message_count=message_count,
+        structured_output=structured_output,
+    )
+    model = reasons["model"]
+    logger.info(
+        "model_routed requested_model=%s selected_model=%s tier=%s backend=%s message_count=%s structured_output=%s signals=%s",
+        requested,
+        model,
+        reasons["tier"],
+        reasons["backend"],
+        message_count,
+        structured_output,
+        ",".join(reasons["signals"]),
+    )
+    return model, True
 
 
 async def _acquire_slot() -> bool:
@@ -96,6 +338,39 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def _request_logging_middleware(request: Request, call_next):
+    request_id = request.headers.get("x-request-id") or uuid.uuid4().hex[:12]
+    token = _request_id_var.set(request_id)
+    _stats["requests_total"] += 1
+    start = time.monotonic()
+    try:
+        response = await call_next(request)
+        duration_ms = int((time.monotonic() - start) * 1000)
+        response.headers["X-Request-Id"] = request_id
+        logger.info(
+            "request_completed method=%s path=%s status=%s duration_ms=%s",
+            request.method,
+            request.url.path,
+            response.status_code,
+            duration_ms,
+        )
+        return response
+    except Exception as exc:
+        _stats["uncaught_exceptions_total"] += 1
+        logger.exception(
+            "request_failed method=%s path=%s",
+            request.method,
+            request.url.path,
+        )
+        if sentry_sdk is not None:
+            sentry_sdk.capture_exception(exc)
+        raise
+    finally:
+        _request_id_var.reset(token)
+
 
 AVAILABLE_MODELS = [
     {"id": "opus", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
@@ -421,8 +696,30 @@ async def health():
         "version": __version__,
         "backend": backend,
         "claude_cli": cli_found,
+        "smart_routing_enabled": _smart_routing_enabled,
+        "smart_routing_force": _smart_routing_force,
+        "routing_default_model": _routing_default_model,
+        "routing_classifier_backend": _routing_classifier_backend,
+        "routing_classifier_model": _routing_classifier_model,
+        "routing_classifier_url": _routing_classifier_url,
+        "routing_tier_models": _routing_tier_models,
+        "pid": os.getpid(),
+        "started_at": int(_started_at),
+        "uptime_seconds": int(time.time() - _started_at),
         "active_requests": _active_count,
         "max_concurrent": _max_concurrent,
+        "stats": _stats,
+    }
+
+
+@app.get("/metrics")
+@app.get("/v1/metrics")
+async def metrics():
+    return {
+        "uptime_seconds": int(time.time() - _started_at),
+        "active_requests": _active_count,
+        "max_concurrent": _max_concurrent,
+        "stats": _stats,
     }
 
 
@@ -437,13 +734,37 @@ async def list_models():
 async def chat_completions(request: Request):
     body = await request.json()
     messages = body.get("messages", [])
-    model = body.get("model", "sonnet")
+    requested_model = body.get("model", _routing_default_model)
     stream = body.get("stream", False)
+    structured_output = body.get("response_format") is not None
 
     system_prompt, prompt = build_prompt(messages)
+    try:
+        model, routed = _select_model(
+            requested_model,
+            prompt,
+            message_count=len(messages),
+            structured_output=structured_output,
+        )
+    except RuntimeError as exc:
+        _stats["routing_failures_total"] += 1
+        logger.error("routing_failed endpoint=chat_completions error=%s", exc)
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": {
+                    "message": f"Routing classifier failed: {exc}",
+                    "type": "routing_error",
+                },
+            },
+        )
+    if routed:
+        _stats_key = f"routed_to_{model}_total"
+        _stats[_stats_key] = _stats.get(_stats_key, 0) + 1
     cmd, stdin_text = build_claude_cmd(prompt, system_prompt, model)
 
     if not await _acquire_slot():
+        _stats["capacity_rejections_total"] += 1
         return JSONResponse(
             status_code=503,
             content={"error": {"message": "Server at capacity", "type": "capacity_error"}},
@@ -461,6 +782,10 @@ async def chat_completions(request: Request):
         proc.stdin.write(stdin_text.encode())
         proc.stdin.write_eof()
     except OSError as exc:
+        _stats["subprocess_start_failures_total"] += 1
+        logger.exception("subprocess_start_failed model=%s", model)
+        if sentry_sdk is not None:
+            sentry_sdk.capture_exception(exc)
         _release_slot()
         return JSONResponse(
             status_code=503,
@@ -517,6 +842,8 @@ async def chat_completions(request: Request):
             _read_cli_result(proc), timeout=_request_timeout,
         )
     except asyncio.TimeoutError:
+        _stats["timeouts_total"] += 1
+        logger.warning("request_timeout model=%s endpoint=chat_completions", model)
         await _cleanup_process(proc)
         _release_slot()
         return JSONResponse(
@@ -528,7 +855,13 @@ async def chat_completions(request: Request):
     _release_slot()
 
     if proc.returncode != 0:
+        _stats["subprocess_errors_total"] += 1
         stderr = await proc.stderr.read()
+        logger.error(
+            "subprocess_failed model=%s endpoint=chat_completions returncode=%s",
+            model,
+            proc.returncode,
+        )
         return JSONResponse(
             status_code=500,
             content={"error": {"message": f"Claude CLI error: {stderr.decode()}", "type": "server_error"}},
@@ -541,15 +874,41 @@ async def chat_completions(request: Request):
 @app.post("/responses")
 async def responses(request: Request):
     body = await request.json()
-    model = body.get("model", "sonnet")
+    requested_model = body.get("model", _routing_default_model)
     stream = body.get("stream", False)
     input_data = body.get("input", "")
     instructions = body.get("instructions")
+    text_blob = f"{instructions or ''}".lower()
+    structured_output = any(k in text_blob for k in ["json", "schema", "structured"])
 
     system_prompt, prompt = build_prompt_responses(input_data, instructions)
+    message_count = len(input_data) if isinstance(input_data, list) else 1
+    try:
+        model, routed = _select_model(
+            requested_model,
+            prompt,
+            message_count=message_count,
+            structured_output=structured_output,
+        )
+    except RuntimeError as exc:
+        _stats["routing_failures_total"] += 1
+        logger.error("routing_failed endpoint=responses error=%s", exc)
+        return JSONResponse(
+            status_code=503,
+            content={
+                "error": {
+                    "message": f"Routing classifier failed: {exc}",
+                    "type": "routing_error",
+                },
+            },
+        )
+    if routed:
+        _stats_key = f"routed_to_{model}_total"
+        _stats[_stats_key] = _stats.get(_stats_key, 0) + 1
     cmd, stdin_text = build_claude_cmd(prompt, system_prompt, model)
 
     if not await _acquire_slot():
+        _stats["capacity_rejections_total"] += 1
         return JSONResponse(
             status_code=503,
             content={"error": {"message": "Server at capacity", "type": "capacity_error"}},
@@ -566,6 +925,10 @@ async def responses(request: Request):
         proc.stdin.write(stdin_text.encode())
         proc.stdin.write_eof()
     except OSError as exc:
+        _stats["subprocess_start_failures_total"] += 1
+        logger.exception("subprocess_start_failed model=%s", model)
+        if sentry_sdk is not None:
+            sentry_sdk.capture_exception(exc)
         _release_slot()
         return JSONResponse(
             status_code=503,
@@ -683,6 +1046,8 @@ async def responses(request: Request):
             _read_cli_result(proc), timeout=_request_timeout,
         )
     except asyncio.TimeoutError:
+        _stats["timeouts_total"] += 1
+        logger.warning("request_timeout model=%s endpoint=responses", model)
         await _cleanup_process(proc)
         _release_slot()
         return JSONResponse(
@@ -694,7 +1059,13 @@ async def responses(request: Request):
     _release_slot()
 
     if proc.returncode != 0:
+        _stats["subprocess_errors_total"] += 1
         stderr = await proc.stderr.read()
+        logger.error(
+            "subprocess_failed model=%s endpoint=responses returncode=%s",
+            model,
+            proc.returncode,
+        )
         return JSONResponse(
             status_code=500,
             content={"error": {"message": f"Claude CLI error: {stderr.decode()}", "type": "server_error"}},
@@ -713,14 +1084,38 @@ async def responses(request: Request):
 async def anthropic_messages(request: Request):
     body = await request.json()
     messages = body.get("messages", [])
-    model = body.get("model", "sonnet")
+    requested_model = body.get("model", _routing_default_model)
     system = body.get("system")
     stream = body.get("stream", False)
 
     system_prompt, prompt, force_json = build_prompt_anthropic(messages, system)
+    try:
+        model, routed = _select_model(
+            requested_model,
+            prompt,
+            message_count=len(messages),
+            structured_output=force_json,
+        )
+    except RuntimeError as exc:
+        _stats["routing_failures_total"] += 1
+        logger.error("routing_failed endpoint=messages error=%s", exc)
+        return JSONResponse(
+            status_code=503,
+            content={
+                "type": "error",
+                "error": {
+                    "type": "routing_error",
+                    "message": f"Routing classifier failed: {exc}",
+                },
+            },
+        )
+    if routed:
+        _stats_key = f"routed_to_{model}_total"
+        _stats[_stats_key] = _stats.get(_stats_key, 0) + 1
     cmd, stdin_text = build_claude_cmd(prompt, system_prompt, model, force_json=force_json)
 
     if not await _acquire_slot():
+        _stats["capacity_rejections_total"] += 1
         return JSONResponse(
             status_code=503,
             content={
@@ -741,6 +1136,10 @@ async def anthropic_messages(request: Request):
         proc.stdin.write(stdin_text.encode())
         proc.stdin.write_eof()
     except OSError as exc:
+        _stats["subprocess_start_failures_total"] += 1
+        logger.exception("subprocess_start_failed model=%s", model)
+        if sentry_sdk is not None:
+            sentry_sdk.capture_exception(exc)
         _release_slot()
         return JSONResponse(
             status_code=503,
@@ -835,6 +1234,8 @@ async def anthropic_messages(request: Request):
             _read_cli_result(proc), timeout=_request_timeout,
         )
     except asyncio.TimeoutError:
+        _stats["timeouts_total"] += 1
+        logger.warning("request_timeout model=%s endpoint=messages", model)
         await _cleanup_process(proc)
         _release_slot()
         return JSONResponse(
@@ -849,7 +1250,13 @@ async def anthropic_messages(request: Request):
     _release_slot()
 
     if proc.returncode != 0:
+        _stats["subprocess_errors_total"] += 1
         stderr = await proc.stderr.read()
+        logger.error(
+            "subprocess_failed model=%s endpoint=messages returncode=%s",
+            model,
+            proc.returncode,
+        )
         return JSONResponse(
             status_code=500,
             content={

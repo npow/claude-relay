@@ -10,6 +10,12 @@ dependencies = [
     "uvicorn>=0.34",
 ]
 
+[project.optional-dependencies]
+observability = [
+    "logtail-python>=0.3.3",
+    "sentry-sdk>=2.0",
+]
+
 [project.scripts]
 agent-relay = "claude_relay.__main__:main"
 claude-relay = "claude_relay.__main__:main"

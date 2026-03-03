@@ -10,6 +10,8 @@ from httpx import ASGITransport, AsyncClient
 from claude_relay import server as _server_mod
 from claude_relay.server import (
     _cleanup_process,
+    _extract_tier,
+    _select_model,
     app,
     build_claude_cmd,
     build_prompt,
@@ -189,6 +191,38 @@ class TestBuildClaudeCmd:
 
 
 # ---------------------------------------------------------------------------
+# Unit tests: smart routing
+# ---------------------------------------------------------------------------
+
+
+class TestSmartRouting:
+    def test_extract_tier(self):
+        assert _extract_tier("MEDIUM") == "MEDIUM"
+        assert _extract_tier("tier: reasoning") == "REASONING"
+
+    def test_extract_tier_raises(self):
+        with pytest.raises(ValueError):
+            _extract_tier("unknown")
+
+    def test_select_model_auto_routes(self):
+        fake = {"tier": "MEDIUM", "model": "sonnet", "signals": ["llm_classifier"], "backend": "ollama"}
+        with patch(f"{MODULE}._classify_tier_ollama", return_value=fake):
+            model, routed = _select_model("auto", "quick question", message_count=1)
+        assert routed is True
+        assert model == "sonnet"
+
+    def test_select_model_explicit_passthrough(self):
+        model, routed = _select_model("opus", "hello", message_count=1)
+        assert model == "opus"
+        assert routed is False
+
+    def test_select_model_raises_when_classifier_backend_unsupported(self):
+        with patch(f"{MODULE}._routing_classifier_backend", "invalid"):
+            with pytest.raises(RuntimeError):
+                _select_model("auto", "hello", message_count=1)
+
+
+# ---------------------------------------------------------------------------
 # Unit tests: response builders
 # ---------------------------------------------------------------------------
 
@@ -235,6 +269,21 @@ async def test_health(client):
     assert body["status"] in ("ok", "degraded")
     assert "version" in body
     assert "claude_cli" in body
+    assert "pid" in body
+    assert "started_at" in body
+    assert "uptime_seconds" in body
+    assert "stats" in body
+
+
+@pytest.mark.anyio
+async def test_metrics(client):
+    resp = await client.get("/v1/metrics")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert "uptime_seconds" in body
+    assert "active_requests" in body
+    assert "max_concurrent" in body
+    assert "stats" in body
 
 
 @pytest.mark.anyio

@@ -167,9 +167,132 @@ agent-relay serve [--host HOST] [--port PORT]
 | `/v1/responses` | POST | Responses API (OpenAI-compatible) |
 | `/v1/messages` | POST | Messages (Anthropic-compatible) |
 | `/v1/models` | GET | List available models |
+| `/v1/metrics` | GET | Relay counters and uptime |
 | `/health` | GET | Server and CLI status |
 
 All endpoints also work without the `/v1` prefix. CORS is enabled for all origins.
+
+## Observability
+
+Request logging is enabled by default with:
+
+- request method, path, status, and duration
+- per-request `X-Request-Id` header (accepts incoming `x-request-id` too)
+- in-process counters exposed at `/metrics` (and `/v1/metrics`)
+
+Environment variables:
+
+| Variable | Default | Description |
+|---|---|---|
+| `AGENT_RELAY_LOG_LEVEL` | `INFO` | Python log level |
+| `SENTRY_DSN` | unset | Enable Sentry error reporting |
+| `SENTRY_TRACES_SAMPLE_RATE` | `0.0` | Sentry tracing sample rate |
+| `SENTRY_ENVIRONMENT` | unset | Sentry environment tag |
+| `SENTRY_LOG_LEVEL` | `INFO` | Breadcrumb/log capture threshold sent to Sentry |
+| `SENTRY_EVENT_LEVEL` | `ERROR` | Log level that becomes a Sentry event |
+| `BETTERSTACK_SOURCE_TOKEN` | unset | Send logs to Better Stack |
+| `BETTERSTACK_INGESTING_HOST` | `https://in.logs.betterstack.com` | Better Stack ingest host |
+| `BETTERSTACK_LOG_LEVEL` | `INFO` | Better Stack handler level |
+| `AGENT_RELAY_SMART_ROUTING` | `false` | Route default/auto requests to `haiku`/`sonnet`/`opus` |
+| `AGENT_RELAY_SMART_ROUTING_FORCE` | `false` | Route even when a specific model is requested |
+| `AGENT_RELAY_ROUTING_DEFAULT_MODEL` | `sonnet` | Base model used when model is omitted |
+| `AGENT_RELAY_ROUTING_CLASSIFIER_BACKEND` | `ollama` | Router classifier backend |
+| `AGENT_RELAY_ROUTING_CLASSIFIER_MODEL` | `qwen2.5:3b` | Local classifier model |
+| `AGENT_RELAY_ROUTING_CLASSIFIER_URL` | `http://127.0.0.1:11434/api/chat` | Local classifier endpoint |
+| `AGENT_RELAY_ROUTING_CLASSIFIER_TIMEOUT` | `2.0` | Classifier timeout in seconds |
+| `AGENT_RELAY_ROUTING_CLASSIFIER_CACHE_TTL` | `600` | Classifier cache TTL in seconds |
+| `AGENT_RELAY_ROUTE_MODEL_SIMPLE` | `haiku` | Model for SIMPLE tier |
+| `AGENT_RELAY_ROUTE_MODEL_MEDIUM` | `sonnet` | Model for MEDIUM tier |
+| `AGENT_RELAY_ROUTE_MODEL_COMPLEX` | `opus` | Model for COMPLEX tier |
+| `AGENT_RELAY_ROUTE_MODEL_REASONING` | `opus` | Model for REASONING tier |
+
+Install Sentry support:
+
+```bash
+uv pip install 'agentrelay-cli[observability]'
+```
+
+Crash detection tip: monitor `/health` fields `pid` and `started_at`; if either changes unexpectedly, the process restarted.
+
+Minimal setup example:
+
+```bash
+export SENTRY_DSN="https://<key>@o<org>.ingest.sentry.io/<project>"
+export SENTRY_ENVIRONMENT="prod"
+export SENTRY_TRACES_SAMPLE_RATE="0.1"
+export SENTRY_LOG_LEVEL="INFO"
+export SENTRY_EVENT_LEVEL="ERROR"
+agent-relay serve
+```
+
+### Better Stack logs
+
+Install observability extras:
+
+```bash
+uv pip install 'agentrelay-cli[observability]'
+```
+
+Set env vars and run:
+
+```bash
+export BETTERSTACK_SOURCE_TOKEN="<your-source-token>"
+export BETTERSTACK_INGESTING_HOST="https://in.logs.betterstack.com"
+export BETTERSTACK_LOG_LEVEL="INFO"
+agent-relay serve
+```
+
+Then open Better Stack Logs and filter by `service=claude-relay` or `request_id`.
+
+### Smart model routing
+
+Use `model: "auto"` (or enable global routing) to let relay choose a model by prompt complexity:
+
+```bash
+export AGENT_RELAY_SMART_ROUTING=true
+export AGENT_RELAY_ROUTING_DEFAULT_MODEL=sonnet
+agent-relay serve
+```
+
+Behavior:
+
+- routing is LLM-first (local classifier), no rule fallback path
+- explicit model choice is preserved unless `AGENT_RELAY_SMART_ROUTING_FORCE=true`
+- if classifier fails/times out, request returns `routing_error` (HTTP 503)
+
+Strategy notes:
+
+- tier classifier returns exactly one tier: SIMPLE/MEDIUM/COMPLEX/REASONING
+- tier maps to configurable models via env vars
+
+### Ship local logs to remote Grafana/Loki (with reconnect)
+
+If `agent-relay` runs on your laptop and Grafana/Loki is on another host (for example `hetzner-recon`), use the included scripts:
+
+Terminal 1:
+
+```bash
+./scripts/run-relay-with-logfile.sh
+```
+
+Terminal 2:
+
+```bash
+./scripts/run-promtail-shipper.sh hetzner-recon
+```
+
+What this does:
+
+- keeps a local durable log file at `~/.claude-relay-observability/logs/relay.log`
+- starts an SSH tunnel to remote Loki (`127.0.0.1:3100` on the remote host)
+- runs Promtail in Docker to ship logs to Loki through the tunnel
+- auto-reconnects the tunnel if network drops, then Promtail resumes sending
+
+Grafana Explore query:
+
+```logql
+{job="claude-relay", service="claude-relay"}
+```
 
 ### Supported features
 
