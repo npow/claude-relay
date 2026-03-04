@@ -3,6 +3,7 @@ __pycache__/
 .venv/
 .pytest_cache/
 dist/
+compat/*/dist/
 CLAUDE.md
 *.egg-info/
 uv.lock
