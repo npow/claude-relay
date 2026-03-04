@@ -852,6 +852,10 @@ async def chat_completions(request: Request):
             status_code=504,
             content={"error": {"message": "Request timed out", "type": "timeout_error"}},
         )
+    except Exception:
+        await _cleanup_process(proc)
+        _release_slot()
+        raise
 
     _active_processes.discard(proc)
     _release_slot()
@@ -1056,6 +1060,10 @@ async def responses(request: Request):
             status_code=504,
             content={"error": {"message": "Request timed out", "type": "timeout_error"}},
         )
+    except Exception:
+        await _cleanup_process(proc)
+        _release_slot()
+        raise
 
     _active_processes.discard(proc)
     _release_slot()
@@ -1247,6 +1255,10 @@ async def anthropic_messages(request: Request):
                 "error": {"type": "timeout_error", "message": "Request timed out"},
             },
         )
+    except Exception:
+        await _cleanup_process(proc)
+        _release_slot()
+        raise
 
     _active_processes.discard(proc)
     _release_slot()
