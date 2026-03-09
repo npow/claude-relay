@@ -3,7 +3,7 @@
 [![CI](https://github.com/npow/claude-relay/actions/workflows/ci.yml/badge.svg)](https://github.com/npow/claude-relay/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/agentrelay-cli)](https://pypi.org/project/agentrelay-cli/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/) [![Docs](https://img.shields.io/badge/docs-mintlify-18a34a?style=flat-square)](https://mintlify.com/npow/claude-relay)
 
 Drop-in OpenAI **and Anthropic** API server that routes through agent CLIs (currently [Claude Code](https://docs.anthropic.com/en/docs/claude-code)).
 
