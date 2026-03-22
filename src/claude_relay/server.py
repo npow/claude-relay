@@ -19,6 +19,20 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
+try:
+    from anthropic_tokenizer import count_tokens as _claude_count_tokens
+except ImportError:
+    _claude_count_tokens = None
+
+
+def _count_output_tokens(text: str) -> int:
+    """Count output tokens using Claude's tokenizer, or estimate."""
+    if not text:
+        return 0
+    if _claude_count_tokens is not None:
+        return _claude_count_tokens(text)
+    return len(text) // 4  # rough fallback
+
 from . import __version__
 
 try:
@@ -553,6 +567,8 @@ def build_claude_cmd(
 
 
 def make_chat_response(text: str, model: str, usage: dict | None = None) -> dict:
+    completion_tokens = _count_output_tokens(text)
+    prompt_tokens = (usage or {}).get("input_tokens", 0)
     return {
         "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
         "object": "chat.completion",
@@ -566,12 +582,9 @@ def make_chat_response(text: str, model: str, usage: dict | None = None) -> dict
             }
         ],
         "usage": {
-            "prompt_tokens": (usage or {}).get("input_tokens", 0),
-            "completion_tokens": (usage or {}).get("output_tokens", 0),
-            "total_tokens": (
-                (usage or {}).get("input_tokens", 0)
-                + (usage or {}).get("output_tokens", 0)
-            ),
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": prompt_tokens + completion_tokens,
         },
     }
 
@@ -594,9 +607,9 @@ def make_stream_chunk(
     }
 
 
-def _usage_openai_responses(usage: dict | None = None) -> dict:
+def _usage_openai_responses(usage: dict | None = None, text: str = "") -> dict:
     input_tokens = (usage or {}).get("input_tokens", 0)
-    output_tokens = (usage or {}).get("output_tokens", 0)
+    output_tokens = _count_output_tokens(text)
     return {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
@@ -628,7 +641,7 @@ def make_responses_response(text: str, model: str, usage: dict | None = None) ->
             }
         ],
         "output_text": text,
-        "usage": _usage_openai_responses(usage),
+        "usage": _usage_openai_responses(usage, text),
     }
 
 
@@ -648,7 +661,7 @@ def make_anthropic_response(text: str, model: str, usage: dict | None = None) ->
         "stop_sequence": None,
         "usage": {
             "input_tokens": (usage or {}).get("input_tokens", 0),
-            "output_tokens": (usage or {}).get("output_tokens", 0),
+            "output_tokens": _count_output_tokens(text),
         },
     }
 
@@ -1033,7 +1046,7 @@ async def responses(request: Request):
                             }
                         ],
                         "output_text": output_text,
-                        "usage": _usage_openai_responses(usage),
+                        "usage": _usage_openai_responses(usage, output_text),
                     },
                 }) + "\n\n"
                 yield "data: [DONE]\n\n"
