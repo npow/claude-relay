@@ -567,7 +567,7 @@ def build_claude_cmd(
 
 
 def make_chat_response(text: str, model: str, usage: dict | None = None) -> dict:
-    completion_tokens = _count_output_tokens(text)
+    completion_tokens = (usage or {}).get("output_tokens", 0)
     prompt_tokens = (usage or {}).get("input_tokens", 0)
     return {
         "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
@@ -609,7 +609,7 @@ def make_stream_chunk(
 
 def _usage_openai_responses(usage: dict | None = None, text: str = "") -> dict:
     input_tokens = (usage or {}).get("input_tokens", 0)
-    output_tokens = _count_output_tokens(text)
+    output_tokens = (usage or {}).get("output_tokens", 0)
     return {
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
@@ -661,7 +661,7 @@ def make_anthropic_response(text: str, model: str, usage: dict | None = None) ->
         "stop_sequence": None,
         "usage": {
             "input_tokens": (usage or {}).get("input_tokens", 0),
-            "output_tokens": _count_output_tokens(text),
+            "output_tokens": (usage or {}).get("output_tokens", 0),
         },
     }
 
