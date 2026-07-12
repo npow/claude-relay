@@ -14,6 +14,7 @@ from claude_relay.server import (
     _select_model,
     app,
     build_claude_cmd,
+    build_codex_cmd,
     build_prompt,
     build_prompt_anthropic,
     build_prompt_responses,
@@ -190,6 +191,25 @@ class TestBuildClaudeCmd:
         assert "--system-prompt" not in cmd
 
 
+class TestBuildCodexCmd:
+    def test_subscription_cli_command(self):
+        cmd, stdin_text = build_codex_cmd("Hi", None, "gpt-5.6-sol")
+        assert cmd[:3] == ["codex", "exec", "--json"]
+        assert "--ephemeral" in cmd
+        assert cmd[cmd.index("--model") + 1] == "gpt-5.6-sol"
+        assert cmd[-1] == "-"
+        assert stdin_text == "Hi"
+
+    def test_system_prompt_uses_stdin(self):
+        cmd, stdin_text = build_codex_cmd("Hi", "Be concise.", "gpt-5.6-sol")
+        assert "--system-prompt" not in cmd
+        assert stdin_text == "System instructions:\nBe concise.\n\nHi"
+
+    def test_force_json_instruction(self):
+        _, stdin_text = build_codex_cmd("Hi", None, "gpt-5.6-sol", force_json=True)
+        assert "valid JSON object" in stdin_text
+
+
 # ---------------------------------------------------------------------------
 # Unit tests: smart routing
 # ---------------------------------------------------------------------------
@@ -220,6 +240,15 @@ class TestSmartRouting:
         with patch(f"{MODULE}._routing_classifier_backend", "invalid"):
             with pytest.raises(RuntimeError):
                 _select_model("auto", "hello", message_count=1)
+
+    def test_codex_maps_claude_model_to_default(self):
+        with (
+            patch(f"{MODULE}._backend", "codex"),
+            patch(f"{MODULE}._routing_default_model", "gpt-5.6-sol"),
+        ):
+            model, routed = _select_model("claude-sonnet-4-6", "hello")
+        assert model == "gpt-5.6-sol"
+        assert routed is False
 
 
 # ---------------------------------------------------------------------------

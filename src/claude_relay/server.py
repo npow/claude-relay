@@ -1,4 +1,4 @@
-"""OpenAI- and Anthropic-compatible API proxy that routes requests through Claude Code CLI."""
+"""OpenAI- and Anthropic-compatible API proxy for agent CLIs."""
 
 import asyncio
 import contextvars
@@ -54,8 +54,8 @@ except ImportError:  # pragma: no cover - optional dependency
 _max_concurrent: int = int(os.environ.get("CLAUDE_RELAY_MAX_CONCURRENT", "10"))
 _request_timeout: float = float(os.environ.get("CLAUDE_RELAY_REQUEST_TIMEOUT", "300"))
 _active_processes: set = set()
-# Environment for child claude processes — strip relay URL vars to prevent recursive loops
-_subprocess_env: dict = {k: v for k, v in os.environ.items() if k not in ("ANTHROPIC_BASE_URL", "OPENAI_BASE_URL", "CLAUDECODE")}
+_backend: str = os.environ.get("AGENT_RELAY_BACKEND", "claude").lower()
+_relay_env_vars = {"ANTHROPIC_BASE_URL", "OPENAI_BASE_URL", "CLAUDECODE"}
 _active_count: int = 0
 _semaphore: asyncio.Semaphore = asyncio.Semaphore(_max_concurrent)
 _started_at: float = time.time()
@@ -151,7 +151,10 @@ _stats: dict[str, int] = {
 }
 _smart_routing_enabled: bool = os.environ.get("AGENT_RELAY_SMART_ROUTING", "false").lower() in {"1", "true", "yes", "on"}
 _smart_routing_force: bool = os.environ.get("AGENT_RELAY_SMART_ROUTING_FORCE", "false").lower() in {"1", "true", "yes", "on"}
-_routing_default_model: str = os.environ.get("AGENT_RELAY_ROUTING_DEFAULT_MODEL", "sonnet")
+_routing_default_model: str = os.environ.get(
+    "AGENT_RELAY_ROUTING_DEFAULT_MODEL",
+    "gpt-5.6-sol" if _backend == "codex" else "sonnet",
+)
 _routing_tier_models: dict[str, str] = {
     "SIMPLE": os.environ.get("AGENT_RELAY_ROUTE_MODEL_SIMPLE", "haiku"),
     "MEDIUM": os.environ.get("AGENT_RELAY_ROUTE_MODEL_MEDIUM", "sonnet"),
@@ -261,6 +264,12 @@ def _select_model(
 ) -> tuple[str, bool]:
     """Select model based on request + routing config. Returns (model, routed)."""
     requested = (requested_model or "").strip()
+    if _backend == "codex" and (
+        not requested
+        or requested in {"auto", "default", "opus", "sonnet", "haiku"}
+        or requested.startswith("claude-")
+    ):
+        requested = _routing_default_model
     if not requested:
         requested = _routing_default_model
     should_route = (
@@ -388,11 +397,23 @@ async def _request_logging_middleware(request: Request, call_next):
         _request_id_var.reset(token)
 
 
-AVAILABLE_MODELS = [
+CLAUDE_MODELS = [
     {"id": "opus", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
     {"id": "sonnet", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
     {"id": "haiku", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
 ]
+
+
+def _available_models() -> list[dict]:
+    if _backend == "codex":
+        return [{
+            "id": _routing_default_model,
+            "object": "model",
+            "created": 1700000000,
+            "owned_by": "openai",
+            "display_name": f"{_routing_default_model} (Codex subscription)",
+        }]
+    return CLAUDE_MODELS
 
 
 # ---------------------------------------------------------------------------
@@ -533,7 +554,7 @@ def build_prompt_responses(
 
 
 # ---------------------------------------------------------------------------
-# Claude CLI command
+# Backend CLI commands
 # ---------------------------------------------------------------------------
 
 
@@ -559,6 +580,48 @@ def build_claude_cmd(
     if effective_system:
         cmd.extend(["--system-prompt", effective_system])
     return cmd, prompt
+
+
+def build_codex_cmd(
+    prompt: str,
+    system_prompt: Optional[str],
+    model: Optional[str],
+    force_json: bool = False,
+) -> tuple[list[str], str]:
+    """Build a non-interactive Codex CLI invocation using subscription auth."""
+    cmd = [
+        "codex",
+        "exec",
+        "--json",
+        "--ephemeral",
+        "--sandbox",
+        os.environ.get("AGENT_RELAY_CODEX_SANDBOX", "workspace-write"),
+        "--skip-git-repo-check",
+    ]
+    if model:
+        cmd.extend(["--model", model])
+
+    instructions: list[str] = []
+    if system_prompt:
+        instructions.append(f"System instructions:\n{system_prompt}")
+    if force_json:
+        instructions.append(
+            "Return exactly one valid JSON object with no markdown or surrounding prose.",
+        )
+    instructions.append(prompt)
+    cmd.append("-")
+    return cmd, "\n\n".join(part for part in instructions if part)
+
+
+def build_cli_cmd(
+    prompt: str,
+    system_prompt: Optional[str],
+    model: Optional[str],
+    force_json: bool = False,
+) -> tuple[list[str], str]:
+    if _backend == "codex":
+        return build_codex_cmd(prompt, system_prompt, model, force_json=force_json)
+    return build_claude_cmd(prompt, system_prompt, model, force_json=force_json)
 
 
 # ---------------------------------------------------------------------------
@@ -677,7 +740,7 @@ def make_anthropic_stream_event(event_type: str, data: dict) -> str:
 
 
 async def _read_cli_result(proc) -> tuple[str, dict]:
-    """Read all stdout from a Claude CLI subprocess, return *(text, usage)*."""
+    """Read all stdout from an agent CLI subprocess, return *(text, usage)*."""
     result_text = ""
     usage: dict = {}
     async for raw in proc.stdout:
@@ -688,11 +751,58 @@ async def _read_cli_result(proc) -> tuple[str, dict]:
             event = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if event.get("type") == "result":
+        event_type = event.get("type")
+        if event_type == "result":
             result_text = event.get("result", "")
             usage = event.get("usage", {})
+        elif event_type == "item.completed":
+            item = event.get("item", {})
+            if item.get("type") == "agent_message":
+                result_text += item.get("text", "")
+        elif event_type == "turn.completed":
+            usage = event.get("usage", {})
+        elif event_type == "stream_event":
+            inner = event.get("event", {})
+            if inner.get("type") == "content_block_delta":
+                delta = inner.get("delta", {})
+                if delta.get("type") == "text_delta":
+                    result_text += delta.get("text", "")
     await proc.wait()
     return result_text, usage
+
+
+def _stream_event_data(event: dict) -> tuple[str, dict]:
+    """Extract incremental response text and usage from either CLI format."""
+    event_type = event.get("type")
+    if event_type == "item.completed":
+        item = event.get("item", {})
+        if item.get("type") == "agent_message":
+            return item.get("text", ""), {}
+    if event_type == "turn.completed":
+        return "", event.get("usage", {})
+    if event_type != "stream_event":
+        return "", event.get("usage", {}) if event_type == "result" else {}
+
+    inner = event.get("event", {})
+    if inner.get("type") == "content_block_delta":
+        delta = inner.get("delta", {})
+        if delta.get("type") == "text_delta":
+            return delta.get("text", ""), {}
+    if inner.get("type") == "message_delta":
+        return "", inner.get("usage", {})
+    return "", {}
+
+
+def _subprocess_environment() -> dict:
+    env = {key: value for key, value in os.environ.items() if key not in _relay_env_vars}
+    if _backend == "codex":
+        env.pop("OPENAI_API_KEY", None)
+        env.pop("CODEX_API_KEY", None)
+    return env
+
+
+def _cli_error_label() -> str:
+    return "Codex CLI" if _backend == "codex" else "Claude CLI"
 
 
 # ---------------------------------------------------------------------------
@@ -702,14 +812,14 @@ async def _read_cli_result(proc) -> tuple[str, dict]:
 
 @app.get("/health")
 async def health():
-    backend = os.environ.get("AGENT_RELAY_BACKEND", "claude")
-    cli_found = shutil.which("claude") is not None
-    if backend == "codex":
-        cli_found = shutil.which("codex") is not None
+    cli_name = "codex" if _backend == "codex" else "claude"
+    cli_found = shutil.which(cli_name) is not None
     return {
         "status": "ok" if cli_found else "degraded",
         "version": __version__,
-        "backend": backend,
+        "backend": _backend,
+        "cli": cli_name,
+        "cli_found": cli_found,
         "claude_cli": cli_found,
         "smart_routing_enabled": _smart_routing_enabled,
         "smart_routing_force": _smart_routing_force,
@@ -741,7 +851,7 @@ async def metrics():
 @app.get("/v1/models")
 @app.get("/models")
 async def list_models():
-    return {"object": "list", "data": AVAILABLE_MODELS}
+    return {"object": "list", "data": _available_models()}
 
 
 @app.post("/v1/chat/completions")
@@ -776,7 +886,7 @@ async def chat_completions(request: Request):
     if routed:
         _stats_key = f"routed_to_{model}_total"
         _stats[_stats_key] = _stats.get(_stats_key, 0) + 1
-    cmd, stdin_text = build_claude_cmd(prompt, system_prompt, model)
+    cmd, stdin_text = build_cli_cmd(prompt, system_prompt, model)
 
     if not await _acquire_slot():
         _stats["capacity_rejections_total"] += 1
@@ -792,7 +902,7 @@ async def chat_completions(request: Request):
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=os.environ.get("CLAUDE_RELAY_CWD", None),
-            env=_subprocess_env,
+            env=_subprocess_environment(),
         )
         proc.stdin.write(stdin_text.encode())
         proc.stdin.write_eof()
@@ -828,18 +938,10 @@ async def chat_completions(request: Request):
                         event = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    if event.get("type") != "stream_event":
-                        continue
-                    inner = event.get("event", {})
-                    if inner.get("type") == "content_block_delta":
-                        delta = inner.get("delta", {})
-                        if delta.get("type") == "text_delta":
-                            text = delta.get("text", "")
-                            if text:
-                                yield f"data: {json.dumps(make_stream_chunk(text, model, chunk_id))}\n\n"
-                    elif inner.get("type") == "message_delta":
-                        if inner.get("delta", {}).get("stop_reason"):
-                            yield f"data: {json.dumps(make_stream_chunk('', model, chunk_id, finish_reason='stop'))}\n\n"
+                    text, _ = _stream_event_data(event)
+                    if text:
+                        yield f"data: {json.dumps(make_stream_chunk(text, model, chunk_id))}\n\n"
+                yield f"data: {json.dumps(make_stream_chunk('', model, chunk_id, finish_reason='stop'))}\n\n"
                 yield "data: [DONE]\n\n"
             finally:
                 await _cleanup_process(proc)
@@ -883,7 +985,7 @@ async def chat_completions(request: Request):
         )
         return JSONResponse(
             status_code=500,
-            content={"error": {"message": f"Claude CLI error: {stderr.decode()}", "type": "server_error"}},
+            content={"error": {"message": f"{_cli_error_label()} error: {stderr.decode()}", "type": "server_error"}},
         )
 
     return JSONResponse(content=make_chat_response(result_text, model, usage))
@@ -924,7 +1026,7 @@ async def responses(request: Request):
     if routed:
         _stats_key = f"routed_to_{model}_total"
         _stats[_stats_key] = _stats.get(_stats_key, 0) + 1
-    cmd, stdin_text = build_claude_cmd(prompt, system_prompt, model)
+    cmd, stdin_text = build_cli_cmd(prompt, system_prompt, model)
 
     if not await _acquire_slot():
         _stats["capacity_rejections_total"] += 1
@@ -939,7 +1041,8 @@ async def responses(request: Request):
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            env=_subprocess_env,
+            cwd=os.environ.get("CLAUDE_RELAY_CWD", None),
+            env=_subprocess_environment(),
         )
         proc.stdin.write(stdin_text.encode())
         proc.stdin.write_eof()
@@ -988,30 +1091,19 @@ async def responses(request: Request):
                     except json.JSONDecodeError:
                         continue
 
-                    if event.get("type") == "result":
-                        usage = event.get("usage", {})
-                        if event.get("result"):
-                            output_text = event.get("result")
-                        continue
-
-                    if event.get("type") != "stream_event":
-                        continue
-
-                    inner = event.get("event", {})
-                    if inner.get("type") == "content_block_delta":
-                        delta = inner.get("delta", {})
-                        if delta.get("type") == "text_delta":
-                            text = delta.get("text", "")
-                            if text:
-                                output_text += text
-                                yield "data: " + json.dumps({
-                                    "type": "response.output_text.delta",
-                                    "response_id": response_id,
-                                    "item_id": message_id,
-                                    "output_index": 0,
-                                    "content_index": 0,
-                                    "delta": text,
-                                }) + "\n\n"
+                    text, event_usage = _stream_event_data(event)
+                    if event_usage:
+                        usage = event_usage
+                    if text:
+                        output_text += text
+                        yield "data: " + json.dumps({
+                            "type": "response.output_text.delta",
+                            "response_id": response_id,
+                            "item_id": message_id,
+                            "output_index": 0,
+                            "content_index": 0,
+                            "delta": text,
+                        }) + "\n\n"
 
                 await proc.wait()
                 yield "data: " + json.dumps({
@@ -1091,7 +1183,7 @@ async def responses(request: Request):
         )
         return JSONResponse(
             status_code=500,
-            content={"error": {"message": f"Claude CLI error: {stderr.decode()}", "type": "server_error"}},
+            content={"error": {"message": f"{_cli_error_label()} error: {stderr.decode()}", "type": "server_error"}},
         )
 
     return JSONResponse(content=make_responses_response(result_text, model, usage))
@@ -1135,7 +1227,7 @@ async def anthropic_messages(request: Request):
     if routed:
         _stats_key = f"routed_to_{model}_total"
         _stats[_stats_key] = _stats.get(_stats_key, 0) + 1
-    cmd, stdin_text = build_claude_cmd(prompt, system_prompt, model, force_json=force_json)
+    cmd, stdin_text = build_cli_cmd(prompt, system_prompt, model, force_json=force_json)
 
     if not await _acquire_slot():
         _stats["capacity_rejections_total"] += 1
@@ -1154,7 +1246,7 @@ async def anthropic_messages(request: Request):
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=os.environ.get("CLAUDE_RELAY_CWD", None),
-            env=_subprocess_env,
+            env=_subprocess_environment(),
         )
         proc.stdin.write(stdin_text.encode())
         proc.stdin.write_eof()
@@ -1211,21 +1303,15 @@ async def anthropic_messages(request: Request):
                         event = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    if event.get("type") != "stream_event":
-                        continue
-                    inner = event.get("event", {})
-                    if inner.get("type") == "content_block_delta":
-                        delta = inner.get("delta", {})
-                        if delta.get("type") == "text_delta":
-                            text = delta.get("text", "")
-                            if text:
-                                yield make_anthropic_stream_event("content_block_delta", {
-                                    "type": "content_block_delta",
-                                    "index": 0,
-                                    "delta": {"type": "text_delta", "text": text},
-                                })
-                    elif inner.get("type") == "message_delta":
-                        output_tokens = inner.get("usage", {}).get("output_tokens", 0)
+                    text, event_usage = _stream_event_data(event)
+                    if event_usage:
+                        output_tokens = event_usage.get("output_tokens", output_tokens)
+                    if text:
+                        yield make_anthropic_stream_event("content_block_delta", {
+                            "type": "content_block_delta",
+                            "index": 0,
+                            "delta": {"type": "text_delta", "text": text},
+                        })
                 # content_block_stop
                 yield make_anthropic_stream_event("content_block_stop", {
                     "type": "content_block_stop",
@@ -1288,7 +1374,7 @@ async def anthropic_messages(request: Request):
             status_code=500,
             content={
                 "type": "error",
-                "error": {"type": "server_error", "message": f"Claude CLI error: {stderr.decode()}"},
+                "error": {"type": "server_error", "message": f"{_cli_error_label()} error: {stderr.decode()}"},
             },
         )
 

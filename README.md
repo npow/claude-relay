@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/) [![Docs](https://img.shields.io/badge/docs-mintlify-18a34a?style=flat-square)](https://mintlify.com/npow/claude-relay)
 
-Drop-in OpenAI **and Anthropic** API server that routes through agent CLIs (currently [Claude Code](https://docs.anthropic.com/en/docs/claude-code)).
+Drop-in OpenAI **and Anthropic** API server that routes through [Claude Code](https://docs.anthropic.com/en/docs/claude-code) or the Codex CLI.
 
 > Compatibility note: `claude-relay` remains available as a compatibility package/command alias.
 
@@ -43,12 +43,50 @@ agent-relay serve
 # Server starts on http://localhost:18082
 ```
 
-### Run as background service (macOS)
+### Use a ChatGPT subscription from Claude Code
+
+First sign Codex in with ChatGPT (not an API key), then start the Codex backend:
+
+```bash
+codex login
+agent-relay serve --backend codex --model gpt-5.6-sol
+```
+
+Launch Claude Code through the local Anthropic-compatible endpoint:
+
+```bash
+ANTHROPIC_BASE_URL=http://127.0.0.1:18082 \
+ANTHROPIC_AUTH_TOKEN=unused \
+ANTHROPIC_MODEL=gpt-5.6-sol \
+ANTHROPIC_CUSTOM_MODEL_OPTION=gpt-5.6-sol \
+CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1 \
+claude
+```
+
+This repository also includes a launcher with those settings:
+
+```bash
+scripts/claude-codex
+```
+
+See [Claude Code through Codex with a ChatGPT subscription](docs/codex-chatgpt-subscription.md) for a reproducible service setup, verification steps, security boundaries, and troubleshooting.
+
+The Codex backend deliberately removes `OPENAI_API_KEY` and `CODEX_API_KEY` from its subprocess environment so Codex uses the existing ChatGPT subscription login. Claude model IDs sent by Claude Code are mapped to the configured Codex model.
+
+### Run as background service (macOS or Linux)
 
 ```bash
 # Install and auto-start on login
 agent-relay service install
 ```
+
+For a Codex subscription service pinned to a model:
+
+```bash
+agent-relay service install --backend codex --model gpt-5.6-sol
+```
+
+Linux uses a `systemd --user` service; macOS uses launchd.
 
 The installer will offer to add these to your `~/.zshrc` (or `~/.bashrc`) so every SDK and agent picks up the relay automatically:
 
@@ -151,13 +189,15 @@ curl http://localhost:18082/v1/messages \
 ## Configuration
 
 ```
-agent-relay serve [--host HOST] [--port PORT]
+agent-relay serve [--host HOST] [--port PORT] [--backend claude|codex] [--model MODEL]
 ```
 
 | Flag | Default | Description |
 |---|---|---|
 | `--host` | `0.0.0.0` | Bind address |
 | `--port` | `18082` | Bind port |
+| `--backend` | `claude` | Agent CLI backend |
+| `--model` | `sonnet` / `gpt-5.6-sol` | Default model for the selected backend |
 
 ## API
 
