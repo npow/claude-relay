@@ -70,6 +70,8 @@ This repository also includes a launcher with those settings. It enables Claude 
 scripts/claude-codex
 ```
 
+The launcher forwards its current directory to the relay, so starting `claude-codex` in a project runs Codex in that project rather than the service installation directory.
+
 See [Claude Code through Codex with a ChatGPT subscription](docs/codex-chatgpt-subscription.md) for a reproducible service setup, verification steps, security boundaries, and troubleshooting.
 
 The Codex backend deliberately removes `OPENAI_API_KEY` and `CODEX_API_KEY` from its subprocess environment so Codex uses the existing ChatGPT subscription login. Claude model IDs sent by Claude Code are mapped to the configured Codex model.

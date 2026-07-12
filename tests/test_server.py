@@ -373,6 +373,40 @@ async def test_non_streaming_with_system_prompt(client):
 
 
 @pytest.mark.anyio
+async def test_request_working_directory_header(client, tmp_path):
+    data = _make_claude_stream_lines(["Done"])
+    proc = _mock_process(data.encode())
+
+    with patch(f"{MODULE}.asyncio.create_subprocess_exec", return_value=proc) as mock_exec:
+        resp = await client.post(
+            "/v1/chat/completions",
+            headers={"X-Agent-Relay-Cwd": str(tmp_path)},
+            json={
+                "model": "sonnet",
+                "messages": [{"role": "user", "content": "Hi"}],
+            },
+        )
+
+    assert resp.status_code == 200
+    assert mock_exec.call_args.kwargs["cwd"] == str(tmp_path.resolve())
+
+
+@pytest.mark.anyio
+async def test_invalid_request_working_directory(client, tmp_path):
+    resp = await client.post(
+        "/v1/chat/completions",
+        headers={"X-Agent-Relay-Cwd": str(tmp_path / "missing")},
+        json={
+            "model": "sonnet",
+            "messages": [{"role": "user", "content": "Hi"}],
+        },
+    )
+
+    assert resp.status_code == 400
+    assert "working directory does not exist" in resp.json()["detail"]
+
+
+@pytest.mark.anyio
 async def test_streaming(client):
     data = _make_claude_stream_lines(["Hello", " world", "!"])
     proc = _mock_process(data.encode())

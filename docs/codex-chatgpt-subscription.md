@@ -95,7 +95,7 @@ systemctl --user show agent-relay.service -p ExecStart -p Environment
 
 ## Launch Claude Code
 
-Use the included launcher from any working directory. The launcher enables Claude Code's `--dangerously-skip-permissions` mode by default:
+Use the included launcher from any working directory. The launcher enables Claude Code's `--dangerously-skip-permissions` mode by default and sends its current directory in the `X-Agent-Relay-Cwd` header:
 
 ```bash
 scripts/claude-codex
@@ -108,6 +108,8 @@ ln -s "$PWD/scripts/claude-codex" "$HOME/.local/bin/claude-codex"
 claude-codex
 ```
 
+The relay validates that directory and uses it as the cwd for the request's Codex subprocess. The service `WorkingDirectory` and `CLAUDE_RELAY_CWD` remain fallbacks for clients that do not send the header.
+
 The equivalent environment is:
 
 ```bash
@@ -118,6 +120,7 @@ export ANTHROPIC_MODEL="gpt-5.6-sol"
 export ANTHROPIC_CUSTOM_MODEL_OPTION="gpt-5.6-sol"
 export ANTHROPIC_CUSTOM_MODEL_OPTION_NAME="GPT-5.6 SOL"
 export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY="1"
+export ANTHROPIC_CUSTOM_HEADERS="X-Agent-Relay-Cwd: $PWD"
 claude --dangerously-skip-permissions
 ```
 

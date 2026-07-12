@@ -13,9 +13,10 @@ import urllib.error
 import urllib.request
 import uuid
 from contextlib import asynccontextmanager as _acm
+from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -805,6 +806,22 @@ def _cli_error_label() -> str:
     return "Codex CLI" if _backend == "codex" else "Claude CLI"
 
 
+def _request_cwd(request: Request) -> str | None:
+    requested_cwd = request.headers.get("x-agent-relay-cwd")
+    configured_cwd = os.environ.get("CLAUDE_RELAY_CWD")
+    raw_cwd = requested_cwd or configured_cwd
+    if not raw_cwd:
+        return None
+
+    cwd = Path(raw_cwd).expanduser().resolve()
+    if not cwd.is_dir():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Agent relay working directory does not exist: {raw_cwd}",
+        )
+    return str(cwd)
+
+
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
@@ -887,6 +904,7 @@ async def chat_completions(request: Request):
         _stats_key = f"routed_to_{model}_total"
         _stats[_stats_key] = _stats.get(_stats_key, 0) + 1
     cmd, stdin_text = build_cli_cmd(prompt, system_prompt, model)
+    request_cwd = _request_cwd(request)
 
     if not await _acquire_slot():
         _stats["capacity_rejections_total"] += 1
@@ -901,7 +919,7 @@ async def chat_completions(request: Request):
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            cwd=os.environ.get("CLAUDE_RELAY_CWD", None),
+            cwd=request_cwd,
             env=_subprocess_environment(),
         )
         proc.stdin.write(stdin_text.encode())
@@ -1027,6 +1045,7 @@ async def responses(request: Request):
         _stats_key = f"routed_to_{model}_total"
         _stats[_stats_key] = _stats.get(_stats_key, 0) + 1
     cmd, stdin_text = build_cli_cmd(prompt, system_prompt, model)
+    request_cwd = _request_cwd(request)
 
     if not await _acquire_slot():
         _stats["capacity_rejections_total"] += 1
@@ -1041,7 +1060,7 @@ async def responses(request: Request):
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            cwd=os.environ.get("CLAUDE_RELAY_CWD", None),
+            cwd=request_cwd,
             env=_subprocess_environment(),
         )
         proc.stdin.write(stdin_text.encode())
@@ -1228,6 +1247,7 @@ async def anthropic_messages(request: Request):
         _stats_key = f"routed_to_{model}_total"
         _stats[_stats_key] = _stats.get(_stats_key, 0) + 1
     cmd, stdin_text = build_cli_cmd(prompt, system_prompt, model, force_json=force_json)
+    request_cwd = _request_cwd(request)
 
     if not await _acquire_slot():
         _stats["capacity_rejections_total"] += 1
@@ -1245,7 +1265,7 @@ async def anthropic_messages(request: Request):
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            cwd=os.environ.get("CLAUDE_RELAY_CWD", None),
+            cwd=request_cwd,
             env=_subprocess_environment(),
         )
         proc.stdin.write(stdin_text.encode())
