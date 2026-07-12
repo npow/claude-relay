@@ -51,6 +51,13 @@ def test_codex_environment_uses_subscription_auth(monkeypatch):
     assert "CODEX_API_KEY" not in env
 
 
+def test_large_codex_message_is_split_without_data_loss():
+    text = "x" * 600
+    chunks = list(server._stream_text_chunks(text))
+    assert [len(chunk) for chunk in chunks] == [256, 256, 88]
+    assert "".join(chunks) == text
+
+
 def test_systemd_unit_selects_codex_subscription_model():
     with patch("claude_relay.service._find_executable", return_value="/opt/agent-relay"):
         unit = _generate_systemd_unit(

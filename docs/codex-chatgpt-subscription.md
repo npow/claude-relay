@@ -110,6 +110,8 @@ claude-codex
 
 The relay validates that directory and uses it as the cwd for the request's Codex subprocess. The service `WorkingDirectory` and `CLAUDE_RELAY_CWD` remain fallbacks for clients that do not send the header.
 
+Codex emits completed assistant messages rather than token-sized text events. The relay splits these into 256-character SSE deltas so terminal clients can render and wrap long responses normally. Set `AGENT_RELAY_STREAM_CHUNK_SIZE` before starting the service to tune that limit.
+
 The equivalent environment is:
 
 ```bash

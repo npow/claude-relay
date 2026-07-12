@@ -816,6 +816,41 @@ async def test_anthropic_streaming(client):
 
 
 @pytest.mark.anyio
+async def test_anthropic_streaming_splits_large_codex_message(client):
+    output_text = "x" * 600
+    data = "\n".join([
+        json.dumps({
+            "type": "item.completed",
+            "item": {"type": "agent_message", "text": output_text},
+        }),
+        json.dumps({
+            "type": "turn.completed",
+            "usage": {"input_tokens": 10, "output_tokens": 150},
+        }),
+    ]) + "\n"
+    proc = _mock_process(data.encode())
+
+    with patch(f"{MODULE}.asyncio.create_subprocess_exec", return_value=proc):
+        resp = await client.post("/v1/messages", json={
+            "model": "sonnet",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "Write a long line"}],
+            "stream": True,
+        })
+
+    deltas = []
+    for line in resp.text.splitlines():
+        if not line.startswith("data: "):
+            continue
+        event = json.loads(line[6:])
+        if event.get("type") == "content_block_delta":
+            deltas.append(event["delta"]["text"])
+
+    assert [len(delta) for delta in deltas] == [256, 256, 88]
+    assert "".join(deltas) == output_text
+
+
+@pytest.mark.anyio
 async def test_anthropic_system_prompt(client):
     data = _make_claude_stream_lines(["Arrr!"])
     proc = _mock_process(data.encode())

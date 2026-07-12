@@ -54,6 +54,10 @@ except ImportError:  # pragma: no cover - optional dependency
 
 _max_concurrent: int = int(os.environ.get("CLAUDE_RELAY_MAX_CONCURRENT", "10"))
 _request_timeout: float = float(os.environ.get("CLAUDE_RELAY_REQUEST_TIMEOUT", "300"))
+_stream_chunk_size: int = max(
+    1,
+    int(os.environ.get("AGENT_RELAY_STREAM_CHUNK_SIZE", "256")),
+)
 _active_processes: set = set()
 _backend: str = os.environ.get("AGENT_RELAY_BACKEND", "claude").lower()
 _relay_env_vars = {"ANTHROPIC_BASE_URL", "OPENAI_BASE_URL", "CLAUDECODE"}
@@ -794,6 +798,12 @@ def _stream_event_data(event: dict) -> tuple[str, dict]:
     return "", {}
 
 
+def _stream_text_chunks(text: str):
+    """Split large CLI events into renderer-friendly SSE text deltas."""
+    for offset in range(0, len(text), _stream_chunk_size):
+        yield text[offset:offset + _stream_chunk_size]
+
+
 def _subprocess_environment() -> dict:
     env = {key: value for key, value in os.environ.items() if key not in _relay_env_vars}
     if _backend == "codex":
@@ -957,8 +967,8 @@ async def chat_completions(request: Request):
                     except json.JSONDecodeError:
                         continue
                     text, _ = _stream_event_data(event)
-                    if text:
-                        yield f"data: {json.dumps(make_stream_chunk(text, model, chunk_id))}\n\n"
+                    for text_chunk in _stream_text_chunks(text):
+                        yield f"data: {json.dumps(make_stream_chunk(text_chunk, model, chunk_id))}\n\n"
                 yield f"data: {json.dumps(make_stream_chunk('', model, chunk_id, finish_reason='stop'))}\n\n"
                 yield "data: [DONE]\n\n"
             finally:
@@ -1115,13 +1125,14 @@ async def responses(request: Request):
                         usage = event_usage
                     if text:
                         output_text += text
+                    for text_chunk in _stream_text_chunks(text):
                         yield "data: " + json.dumps({
                             "type": "response.output_text.delta",
                             "response_id": response_id,
                             "item_id": message_id,
                             "output_index": 0,
                             "content_index": 0,
-                            "delta": text,
+                            "delta": text_chunk,
                         }) + "\n\n"
 
                 await proc.wait()
@@ -1326,11 +1337,11 @@ async def anthropic_messages(request: Request):
                     text, event_usage = _stream_event_data(event)
                     if event_usage:
                         output_tokens = event_usage.get("output_tokens", output_tokens)
-                    if text:
+                    for text_chunk in _stream_text_chunks(text):
                         yield make_anthropic_stream_event("content_block_delta", {
                             "type": "content_block_delta",
                             "index": 0,
-                            "delta": {"type": "text_delta", "text": text},
+                            "delta": {"type": "text_delta", "text": text_chunk},
                         })
                 # content_block_stop
                 yield make_anthropic_stream_event("content_block_stop", {
