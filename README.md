@@ -56,12 +56,13 @@ Launch Claude Code through the local Anthropic-compatible endpoint:
 
 ```bash
 ANTHROPIC_BASE_URL=http://127.0.0.1:18082 \
-ANTHROPIC_AUTH_TOKEN=unused \
 ANTHROPIC_MODEL=gpt-5.6-sol \
 ANTHROPIC_CUSTOM_MODEL_OPTION=gpt-5.6-sol \
 CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1 \
 claude
 ```
+
+Leave `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` unset. Claude Code can use its existing Claude login for client authentication while `ANTHROPIC_BASE_URL` routes inference through the local Codex relay.
 
 This repository also includes a launcher with those settings. It enables Claude Code's `--dangerously-skip-permissions` mode by default:
 

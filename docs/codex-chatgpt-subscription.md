@@ -112,8 +112,8 @@ The equivalent environment is:
 
 ```bash
 unset ANTHROPIC_API_KEY
+unset ANTHROPIC_AUTH_TOKEN
 export ANTHROPIC_BASE_URL="http://127.0.0.1:18082"
-export ANTHROPIC_AUTH_TOKEN="unused"
 export ANTHROPIC_MODEL="gpt-5.6-sol"
 export ANTHROPIC_CUSTOM_MODEL_OPTION="gpt-5.6-sol"
 export ANTHROPIC_CUSTOM_MODEL_OPTION_NAME="GPT-5.6 SOL"
@@ -121,7 +121,7 @@ export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY="1"
 claude --dangerously-skip-permissions
 ```
 
-`ANTHROPIC_AUTH_TOKEN` only satisfies Claude Code's gateway authentication requirement; agent-relay does not validate or forward it to OpenAI. Claude model aliases such as `sonnet` and full `claude-*` IDs are mapped to the configured Codex default model.
+Claude Code uses its existing Claude login for client authentication, while `ANTHROPIC_BASE_URL` routes inference through agent-relay. The relay does not validate or forward the Claude authorization header to OpenAI. Keeping `ANTHROPIC_API_KEY` and `ANTHROPIC_AUTH_TOKEN` unset also avoids Claude Code's custom-auth connector warning. Claude model aliases such as `sonnet` and full `claude-*` IDs are mapped to the configured Codex default model.
 
 ## End-to-end verification
 
@@ -173,7 +173,15 @@ systemctl --user show agent-relay.service -p ExecStart
 
 ### Claude Code warns that connectors are disabled
 
-This is expected for a custom gateway using `ANTHROPIC_AUTH_TOKEN`. The relay supports text requests, but it does not proxy Claude.ai connectors or Anthropic tool-use blocks.
+Unset both custom Anthropic credential variables and start a new session:
+
+```bash
+unset ANTHROPIC_API_KEY
+unset ANTHROPIC_AUTH_TOKEN
+claude-codex
+```
+
+The launcher now does this automatically. The relay supports text requests, but it does not proxy Claude.ai connectors or Anthropic tool-use blocks.
 
 ### Inspect relay failures
 

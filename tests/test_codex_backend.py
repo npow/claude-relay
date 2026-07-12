@@ -74,5 +74,6 @@ def test_claude_code_environment_targets_gateway():
         model="gpt-5.6-sol",
     )
     assert 'export ANTHROPIC_BASE_URL="http://127.0.0.1:18082"' in lines
-    assert 'export ANTHROPIC_AUTH_TOKEN="unused"' in lines
+    assert "unset ANTHROPIC_API_KEY" in lines
+    assert "unset ANTHROPIC_AUTH_TOKEN" in lines
     assert 'export ANTHROPIC_MODEL="gpt-5.6-sol"' in lines

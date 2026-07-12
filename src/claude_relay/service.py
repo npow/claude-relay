@@ -159,7 +159,8 @@ def _env_lines(
     ]
     if backend == "codex":
         lines.extend([
-            'export ANTHROPIC_AUTH_TOKEN="unused"',
+            "unset ANTHROPIC_API_KEY",
+            "unset ANTHROPIC_AUTH_TOKEN",
             f'export ANTHROPIC_MODEL="{model}"',
             f'export ANTHROPIC_CUSTOM_MODEL_OPTION="{model}"',
             'export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY="1"',
