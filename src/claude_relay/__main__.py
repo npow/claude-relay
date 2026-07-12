@@ -15,6 +15,10 @@ def _cpu_count() -> int:
         return os.cpu_count() or 1
 
 
+def _default_model(backend: str) -> str:
+    return "gpt-5.6-sol" if backend == "codex" else "sonnet"
+
+
 def main():
     parser = argparse.ArgumentParser(prog="agent-relay", description="OpenAI-compatible API server for agent CLIs")
     sub = parser.add_subparsers(dest="command")
@@ -30,13 +34,14 @@ def main():
         "--backend",
         choices=["claude", "codex"],
         default=os.environ.get("AGENT_RELAY_BACKEND", "claude"),
-        help="Backend CLI to execute (default: claude). Codex is reserved for future adapter support.",
+        help="Backend CLI to execute (default: claude).",
     )
+    serve_p.add_argument("--model", help="Default backend model")
 
     # --- service management ---
-    svc_p = sub.add_parser("service", help="Manage background service (macOS launchd)")
+    svc_p = sub.add_parser("service", help="Manage background service (launchd or systemd)")
     svc_sub = svc_p.add_subparsers(dest="action")
-    install_p = svc_sub.add_parser("install", help="Install and start the launchd service")
+    install_p = svc_sub.add_parser("install", help="Install and start the background service")
     install_p.add_argument("--port", type=int, default=DEFAULT_PORT, help=f"Port for the service (default: {DEFAULT_PORT})")
     install_p.add_argument("--host", default="127.0.0.1", help="Bind host for the service (default: 127.0.0.1)")
     install_p.add_argument(
@@ -45,8 +50,9 @@ def main():
         default=os.environ.get("AGENT_RELAY_BACKEND", "claude"),
         help="Backend CLI to execute (default: claude).",
     )
-    svc_sub.add_parser("restart", help="Restart the launchd service")
-    svc_sub.add_parser("uninstall", help="Stop and remove the launchd service")
+    install_p.add_argument("--model", help="Default backend model")
+    svc_sub.add_parser("restart", help="Restart the background service")
+    svc_sub.add_parser("uninstall", help="Stop and remove the background service")
     svc_sub.add_parser("status", help="Show service status")
 
     args = parser.parse_args()
@@ -58,9 +64,11 @@ def main():
     if args.command == "serve":
         import uvicorn
 
+        model = args.model or os.environ.get("AGENT_RELAY_ROUTING_DEFAULT_MODEL") or _default_model(args.backend)
         os.environ["CLAUDE_RELAY_MAX_CONCURRENT"] = str(args.max_concurrent)
         os.environ["CLAUDE_RELAY_REQUEST_TIMEOUT"] = str(args.request_timeout)
         os.environ["AGENT_RELAY_BACKEND"] = args.backend
+        os.environ["AGENT_RELAY_ROUTING_DEFAULT_MODEL"] = model
 
         uvicorn.run(
             "claude_relay.server:app",
@@ -73,7 +81,8 @@ def main():
         from claude_relay.service import service_install, service_restart, service_status, service_uninstall
 
         if args.action == "install":
-            service_install(host=args.host, port=args.port, backend=args.backend)
+            model = args.model or os.environ.get("AGENT_RELAY_ROUTING_DEFAULT_MODEL") or _default_model(args.backend)
+            service_install(host=args.host, port=args.port, backend=args.backend, model=model)
         elif args.action == "restart":
             service_restart()
         elif args.action == "uninstall":

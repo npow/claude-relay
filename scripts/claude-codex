@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+unset ANTHROPIC_API_KEY
+unset ANTHROPIC_AUTH_TOKEN
+export ANTHROPIC_BASE_URL="${AGENT_RELAY_URL:-http://127.0.0.1:18082}"
+export ANTHROPIC_MODEL="${AGENT_RELAY_MODEL:-gpt-5.6-sol}"
+export ANTHROPIC_CUSTOM_MODEL_OPTION="$ANTHROPIC_MODEL"
+export ANTHROPIC_CUSTOM_MODEL_OPTION_NAME="GPT-5.6 SOL"
+export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY="1"
+relay_cwd_header="X-Agent-Relay-Cwd: $PWD"
+if [[ -n "${ANTHROPIC_CUSTOM_HEADERS:-}" ]]; then
+    export ANTHROPIC_CUSTOM_HEADERS="${ANTHROPIC_CUSTOM_HEADERS}"$'\n'"${relay_cwd_header}"
+else
+    export ANTHROPIC_CUSTOM_HEADERS="${relay_cwd_header}"
+fi
+
+exec claude --dangerously-skip-permissions "$@"

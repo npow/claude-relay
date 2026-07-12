@@ -1,4 +1,4 @@
-"""OpenAI- and Anthropic-compatible API proxy that routes requests through Claude Code CLI."""
+"""OpenAI- and Anthropic-compatible API proxy for agent CLIs."""
 
 import asyncio
 import contextvars
@@ -13,9 +13,10 @@ import urllib.error
 import urllib.request
 import uuid
 from contextlib import asynccontextmanager as _acm
+from pathlib import Path
 from typing import Optional
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 
@@ -53,9 +54,18 @@ except ImportError:  # pragma: no cover - optional dependency
 
 _max_concurrent: int = int(os.environ.get("CLAUDE_RELAY_MAX_CONCURRENT", "10"))
 _request_timeout: float = float(os.environ.get("CLAUDE_RELAY_REQUEST_TIMEOUT", "300"))
+_stream_chunk_size: int = max(
+    1,
+    int(os.environ.get("AGENT_RELAY_STREAM_CHUNK_SIZE", "256")),
+)
+_subprocess_stream_limit: int = max(
+    64 * 1024,
+    int(os.environ.get("AGENT_RELAY_SUBPROCESS_STREAM_LIMIT", str(8 * 1024 * 1024))),
+)
 _active_processes: set = set()
-# Environment for child claude processes — strip relay URL vars to prevent recursive loops
-_subprocess_env: dict = {k: v for k, v in os.environ.items() if k not in ("ANTHROPIC_BASE_URL", "OPENAI_BASE_URL", "CLAUDECODE")}
+_backend: str = os.environ.get("AGENT_RELAY_BACKEND", "claude").lower()
+_codex_protocol: str = os.environ.get("AGENT_RELAY_CODEX_PROTOCOL", "app-server").lower()
+_relay_env_vars = {"ANTHROPIC_BASE_URL", "OPENAI_BASE_URL", "CLAUDECODE"}
 _active_count: int = 0
 _semaphore: asyncio.Semaphore = asyncio.Semaphore(_max_concurrent)
 _started_at: float = time.time()
@@ -151,7 +161,10 @@ _stats: dict[str, int] = {
 }
 _smart_routing_enabled: bool = os.environ.get("AGENT_RELAY_SMART_ROUTING", "false").lower() in {"1", "true", "yes", "on"}
 _smart_routing_force: bool = os.environ.get("AGENT_RELAY_SMART_ROUTING_FORCE", "false").lower() in {"1", "true", "yes", "on"}
-_routing_default_model: str = os.environ.get("AGENT_RELAY_ROUTING_DEFAULT_MODEL", "sonnet")
+_routing_default_model: str = os.environ.get(
+    "AGENT_RELAY_ROUTING_DEFAULT_MODEL",
+    "gpt-5.6-sol" if _backend == "codex" else "sonnet",
+)
 _routing_tier_models: dict[str, str] = {
     "SIMPLE": os.environ.get("AGENT_RELAY_ROUTE_MODEL_SIMPLE", "haiku"),
     "MEDIUM": os.environ.get("AGENT_RELAY_ROUTE_MODEL_MEDIUM", "sonnet"),
@@ -261,6 +274,12 @@ def _select_model(
 ) -> tuple[str, bool]:
     """Select model based on request + routing config. Returns (model, routed)."""
     requested = (requested_model or "").strip()
+    if _backend == "codex" and (
+        not requested
+        or requested in {"auto", "default", "opus", "sonnet", "haiku"}
+        or requested.startswith("claude-")
+    ):
+        requested = _routing_default_model
     if not requested:
         requested = _routing_default_model
     should_route = (
@@ -309,18 +328,47 @@ def _release_slot() -> None:
     _semaphore.release()
 
 
-async def _cleanup_process(proc: asyncio.subprocess.Process) -> None:
-    """Kill *proc* if still running, wait for it, and deregister."""
+async def _cleanup_process(
+    proc: asyncio.subprocess.Process,
+    graceful: bool = True,
+) -> None:
+    """Stop *proc* and its CLI child cleanly, then deregister it."""
     _active_processes.discard(proc)
-    if proc.returncode is None:
+    if proc.returncode is not None:
+        return
+
+    if graceful and _using_codex_app_server() and proc.stdin is not None:
         try:
-            proc.kill()
-        except ProcessLookupError:
+            if proc.stdin.can_write_eof():
+                proc.stdin.write_eof()
+        except (BrokenPipeError, ConnectionResetError, RuntimeError):
             pass
+
+    if graceful:
         try:
-            await proc.wait()
-        except Exception:
+            await asyncio.wait_for(proc.wait(), timeout=2.0)
+            return
+        except asyncio.TimeoutError:
             pass
+
+    try:
+        proc.terminate()
+    except ProcessLookupError:
+        return
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=2.0)
+        return
+    except asyncio.TimeoutError:
+        pass
+
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        return
+    try:
+        await proc.wait()
+    except Exception:
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -388,11 +436,23 @@ async def _request_logging_middleware(request: Request, call_next):
         _request_id_var.reset(token)
 
 
-AVAILABLE_MODELS = [
+CLAUDE_MODELS = [
     {"id": "opus", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
     {"id": "sonnet", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
     {"id": "haiku", "object": "model", "created": 1700000000, "owned_by": "anthropic"},
 ]
+
+
+def _available_models() -> list[dict]:
+    if _backend == "codex":
+        return [{
+            "id": _routing_default_model,
+            "object": "model",
+            "created": 1700000000,
+            "owned_by": "openai",
+            "display_name": f"{_routing_default_model} (Codex subscription)",
+        }]
+    return CLAUDE_MODELS
 
 
 # ---------------------------------------------------------------------------
@@ -533,7 +593,7 @@ def build_prompt_responses(
 
 
 # ---------------------------------------------------------------------------
-# Claude CLI command
+# Backend CLI commands
 # ---------------------------------------------------------------------------
 
 
@@ -559,6 +619,53 @@ def build_claude_cmd(
     if effective_system:
         cmd.extend(["--system-prompt", effective_system])
     return cmd, prompt
+
+
+def build_codex_cmd(
+    prompt: str,
+    system_prompt: Optional[str],
+    model: Optional[str],
+    force_json: bool = False,
+) -> tuple[list[str], str]:
+    """Build a non-interactive Codex CLI invocation using subscription auth."""
+    if _codex_protocol == "app-server":
+        cmd = ["codex", "app-server", "--stdio"]
+    elif _codex_protocol == "exec":
+        cmd = [
+            "codex",
+            "exec",
+            "--json",
+            "--ephemeral",
+            "--sandbox",
+            os.environ.get("AGENT_RELAY_CODEX_SANDBOX", "workspace-write"),
+            "--skip-git-repo-check",
+        ]
+        if model:
+            cmd.extend(["--model", model])
+        cmd.append("-")
+    else:
+        raise ValueError(f"Unsupported Codex protocol: {_codex_protocol}")
+
+    instructions: list[str] = []
+    if system_prompt:
+        instructions.append(f"System instructions:\n{system_prompt}")
+    if force_json:
+        instructions.append(
+            "Return exactly one valid JSON object with no markdown or surrounding prose.",
+        )
+    instructions.append(prompt)
+    return cmd, "\n\n".join(part for part in instructions if part)
+
+
+def build_cli_cmd(
+    prompt: str,
+    system_prompt: Optional[str],
+    model: Optional[str],
+    force_json: bool = False,
+) -> tuple[list[str], str]:
+    if _backend == "codex":
+        return build_codex_cmd(prompt, system_prompt, model, force_json=force_json)
+    return build_claude_cmd(prompt, system_prompt, model, force_json=force_json)
 
 
 # ---------------------------------------------------------------------------
@@ -676,10 +783,145 @@ def make_anthropic_stream_event(event_type: str, data: dict) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _using_codex_app_server() -> bool:
+    return _backend == "codex" and _codex_protocol == "app-server"
+
+
+async def _write_app_server_message(proc, message: dict) -> None:
+    proc.stdin.write(json.dumps(message, separators=(",", ":")).encode() + b"\n")
+    await proc.stdin.drain()
+
+
+async def _read_app_server_response(proc, request_id: int) -> dict:
+    while True:
+        raw = await proc.stdout.readline()
+        if not raw:
+            stderr = await proc.stderr.read()
+            raise RuntimeError(
+                f"Codex app server exited during startup: {stderr.decode()}",
+            )
+        try:
+            message = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if message.get("id") != request_id:
+            continue
+        if message.get("error"):
+            raise RuntimeError(f"Codex app server error: {message['error']}")
+        return message.get("result", {})
+
+
+async def _start_codex_app_server_turn(
+    proc,
+    prompt: str,
+    model: str,
+    cwd: str | None,
+) -> None:
+    await _write_app_server_message(proc, {
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "clientInfo": {
+                "name": "agent-relay",
+                "version": __version__,
+            },
+        },
+    })
+    await _read_app_server_response(proc, 1)
+    await _write_app_server_message(proc, {
+        "method": "initialized",
+        "params": {},
+    })
+    await _write_app_server_message(proc, {
+        "id": 2,
+        "method": "thread/start",
+        "params": {
+            "model": model,
+            "cwd": cwd,
+            "approvalPolicy": "never",
+            "sandbox": os.environ.get(
+                "AGENT_RELAY_CODEX_SANDBOX",
+                "workspace-write",
+            ),
+            "ephemeral": True,
+        },
+    })
+    thread_result = await _read_app_server_response(proc, 2)
+    thread_id = (thread_result.get("thread") or {}).get("id")
+    if not thread_id:
+        raise RuntimeError("Codex app server did not return a thread id")
+    await _write_app_server_message(proc, {
+        "id": 3,
+        "method": "turn/start",
+        "params": {
+            "threadId": thread_id,
+            "input": [{
+                "type": "text",
+                "text": prompt,
+                "text_elements": [],
+            }],
+            "cwd": cwd,
+            "model": model,
+            "approvalPolicy": "never",
+        },
+    })
+
+
+async def _prepare_cli_process(
+    proc,
+    stdin_text: str,
+    model: str,
+    cwd: str | None,
+) -> None:
+    if _using_codex_app_server():
+        await _start_codex_app_server_turn(proc, stdin_text, model, cwd)
+        return
+    proc.stdin.write(stdin_text.encode())
+    proc.stdin.write_eof()
+
+
+def _app_server_usage(event: dict) -> dict:
+    if event.get("method") != "thread/tokenUsage/updated":
+        return {}
+    last = ((event.get("params") or {}).get("tokenUsage") or {}).get("last") or {}
+    return {
+        "input_tokens": last.get("inputTokens", 0),
+        "output_tokens": last.get("outputTokens", 0),
+    }
+
+
+def _app_server_completed_text(event: dict) -> str:
+    if event.get("method") != "item/completed":
+        return ""
+    item = (event.get("params") or {}).get("item") or {}
+    if item.get("type") != "agentMessage":
+        return ""
+    return item.get("text", "")
+
+
+def _cli_event_done(event: dict) -> bool:
+    return event.get("method") == "turn/completed"
+
+
+def _app_server_event_error(event: dict) -> str | None:
+    if event.get("method") == "error":
+        params = event.get("params") or {}
+        if not params.get("willRetry", False):
+            error = params.get("error") or {}
+            return error.get("message") or str(error)
+    if _cli_event_done(event):
+        turn = (event.get("params") or {}).get("turn") or {}
+        if turn.get("status") == "failed":
+            error = turn.get("error") or {}
+            return error.get("message") or str(error)
+    return None
+
+
 async def _read_cli_result(proc) -> tuple[str, dict]:
-    """Read all stdout from a Claude CLI subprocess, return *(text, usage)*."""
+    """Read all stdout from an agent CLI subprocess, return *(text, usage)*."""
     result_text = ""
     usage: dict = {}
+    saw_app_server_delta = False
     async for raw in proc.stdout:
         line = raw.strip()
         if not line:
@@ -688,11 +930,123 @@ async def _read_cli_result(proc) -> tuple[str, dict]:
             event = json.loads(line)
         except json.JSONDecodeError:
             continue
-        if event.get("type") == "result":
+        event_type = event.get("type")
+        event_error = _app_server_event_error(event)
+        if event_error:
+            raise RuntimeError(event_error)
+        if event.get("method") == "item/agentMessage/delta":
+            result_text += (event.get("params") or {}).get("delta", "")
+            saw_app_server_delta = True
+        elif event.get("method") == "thread/tokenUsage/updated":
+            usage = _app_server_usage(event)
+        elif event.get("method") == "item/completed" and not saw_app_server_delta:
+            result_text += _app_server_completed_text(event)
+        elif _cli_event_done(event):
+            break
+        elif event_type == "result":
             result_text = event.get("result", "")
             usage = event.get("usage", {})
+        elif event_type == "item.completed":
+            item = event.get("item", {})
+            if item.get("type") == "agent_message":
+                result_text += item.get("text", "")
+        elif event_type == "turn.completed":
+            usage = event.get("usage", {})
+        elif event_type == "stream_event":
+            inner = event.get("event", {})
+            if inner.get("type") == "content_block_delta":
+                delta = inner.get("delta", {})
+                if delta.get("type") == "text_delta":
+                    result_text += delta.get("text", "")
+    if _using_codex_app_server() and proc.stdin.can_write_eof():
+        proc.stdin.write_eof()
     await proc.wait()
     return result_text, usage
+
+
+def _stream_event_data(event: dict) -> tuple[str, dict]:
+    """Extract incremental response text and usage from either CLI format."""
+    method = event.get("method")
+    if method == "item/agentMessage/delta":
+        return (event.get("params") or {}).get("delta", ""), {}
+    if method == "thread/tokenUsage/updated":
+        return "", _app_server_usage(event)
+    event_type = event.get("type")
+    if event_type == "item.completed":
+        item = event.get("item", {})
+        if item.get("type") == "agent_message":
+            return item.get("text", ""), {}
+    if event_type == "turn.completed":
+        return "", event.get("usage", {})
+    if event_type != "stream_event":
+        return "", event.get("usage", {}) if event_type == "result" else {}
+
+    inner = event.get("event", {})
+    if inner.get("type") == "content_block_delta":
+        delta = inner.get("delta", {})
+        if delta.get("type") == "text_delta":
+            return delta.get("text", ""), {}
+    if inner.get("type") == "message_delta":
+        return "", inner.get("usage", {})
+    return "", {}
+
+
+def _stream_text_chunks(text: str):
+    """Split large CLI events into renderer-friendly SSE text deltas."""
+    for offset in range(0, len(text), _stream_chunk_size):
+        yield text[offset:offset + _stream_chunk_size]
+
+
+def _subprocess_environment() -> dict:
+    env = {key: value for key, value in os.environ.items() if key not in _relay_env_vars}
+    if _backend == "codex":
+        env.pop("OPENAI_API_KEY", None)
+        env.pop("CODEX_API_KEY", None)
+    return env
+
+
+async def _spawn_cli_process(
+    cmd: list[str],
+    stdin_text: str,
+    model: str,
+    cwd: str | None,
+):
+    proc = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        limit=_subprocess_stream_limit,
+        cwd=cwd,
+        env=_subprocess_environment(),
+    )
+    _active_processes.add(proc)
+    try:
+        await _prepare_cli_process(proc, stdin_text, model, cwd)
+    except Exception:
+        await _cleanup_process(proc, graceful=False)
+        raise
+    return proc
+
+
+def _cli_error_label() -> str:
+    return "Codex CLI" if _backend == "codex" else "Claude CLI"
+
+
+def _request_cwd(request: Request) -> str | None:
+    requested_cwd = request.headers.get("x-agent-relay-cwd")
+    configured_cwd = os.environ.get("CLAUDE_RELAY_CWD")
+    raw_cwd = requested_cwd or configured_cwd
+    if not raw_cwd:
+        return None
+
+    cwd = Path(raw_cwd).expanduser().resolve()
+    if not cwd.is_dir():
+        raise HTTPException(
+            status_code=400,
+            detail=f"Agent relay working directory does not exist: {raw_cwd}",
+        )
+    return str(cwd)
 
 
 # ---------------------------------------------------------------------------
@@ -702,14 +1056,15 @@ async def _read_cli_result(proc) -> tuple[str, dict]:
 
 @app.get("/health")
 async def health():
-    backend = os.environ.get("AGENT_RELAY_BACKEND", "claude")
-    cli_found = shutil.which("claude") is not None
-    if backend == "codex":
-        cli_found = shutil.which("codex") is not None
+    cli_name = "codex" if _backend == "codex" else "claude"
+    cli_found = shutil.which(cli_name) is not None
     return {
         "status": "ok" if cli_found else "degraded",
         "version": __version__,
-        "backend": backend,
+        "backend": _backend,
+        "codex_protocol": _codex_protocol if _backend == "codex" else None,
+        "cli": cli_name,
+        "cli_found": cli_found,
         "claude_cli": cli_found,
         "smart_routing_enabled": _smart_routing_enabled,
         "smart_routing_force": _smart_routing_force,
@@ -741,7 +1096,7 @@ async def metrics():
 @app.get("/v1/models")
 @app.get("/models")
 async def list_models():
-    return {"object": "list", "data": AVAILABLE_MODELS}
+    return {"object": "list", "data": _available_models()}
 
 
 @app.post("/v1/chat/completions")
@@ -776,7 +1131,8 @@ async def chat_completions(request: Request):
     if routed:
         _stats_key = f"routed_to_{model}_total"
         _stats[_stats_key] = _stats.get(_stats_key, 0) + 1
-    cmd, stdin_text = build_claude_cmd(prompt, system_prompt, model)
+    cmd, stdin_text = build_cli_cmd(prompt, system_prompt, model)
+    request_cwd = _request_cwd(request)
 
     if not await _acquire_slot():
         _stats["capacity_rejections_total"] += 1
@@ -786,17 +1142,8 @@ async def chat_completions(request: Request):
         )
 
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=os.environ.get("CLAUDE_RELAY_CWD", None),
-            env=_subprocess_env,
-        )
-        proc.stdin.write(stdin_text.encode())
-        proc.stdin.write_eof()
-    except OSError as exc:
+        proc = await _spawn_cli_process(cmd, stdin_text, model, request_cwd)
+    except Exception as exc:
         _stats["subprocess_start_failures_total"] += 1
         logger.exception("subprocess_start_failed model=%s", model)
         if sentry_sdk is not None:
@@ -807,14 +1154,13 @@ async def chat_completions(request: Request):
             content={"error": {"message": f"Failed to start subprocess: {exc}", "type": "server_error"}},
         )
 
-    _active_processes.add(proc)
-
     if stream:
         chunk_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         initial = make_stream_chunk("", model, chunk_id)
         initial["choices"][0]["delta"] = {"role": "assistant", "content": ""}
 
         async def generate():
+            saw_app_server_delta = False
             try:
                 deadline = time.monotonic() + _request_timeout
                 yield f"data: {json.dumps(initial)}\n\n"
@@ -828,18 +1174,19 @@ async def chat_completions(request: Request):
                         event = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    if event.get("type") != "stream_event":
-                        continue
-                    inner = event.get("event", {})
-                    if inner.get("type") == "content_block_delta":
-                        delta = inner.get("delta", {})
-                        if delta.get("type") == "text_delta":
-                            text = delta.get("text", "")
-                            if text:
-                                yield f"data: {json.dumps(make_stream_chunk(text, model, chunk_id))}\n\n"
-                    elif inner.get("type") == "message_delta":
-                        if inner.get("delta", {}).get("stop_reason"):
-                            yield f"data: {json.dumps(make_stream_chunk('', model, chunk_id, finish_reason='stop'))}\n\n"
+                    event_error = _app_server_event_error(event)
+                    if event_error:
+                        raise RuntimeError(event_error)
+                    text, _ = _stream_event_data(event)
+                    if event.get("method") == "item/agentMessage/delta":
+                        saw_app_server_delta = True
+                    elif not saw_app_server_delta:
+                        text = text or _app_server_completed_text(event)
+                    for text_chunk in _stream_text_chunks(text):
+                        yield f"data: {json.dumps(make_stream_chunk(text_chunk, model, chunk_id))}\n\n"
+                    if _cli_event_done(event):
+                        break
+                yield f"data: {json.dumps(make_stream_chunk('', model, chunk_id, finish_reason='stop'))}\n\n"
                 yield "data: [DONE]\n\n"
             finally:
                 await _cleanup_process(proc)
@@ -859,14 +1206,14 @@ async def chat_completions(request: Request):
     except asyncio.TimeoutError:
         _stats["timeouts_total"] += 1
         logger.warning("request_timeout model=%s endpoint=chat_completions", model)
-        await _cleanup_process(proc)
+        await _cleanup_process(proc, graceful=False)
         _release_slot()
         return JSONResponse(
             status_code=504,
             content={"error": {"message": "Request timed out", "type": "timeout_error"}},
         )
     except Exception:
-        await _cleanup_process(proc)
+        await _cleanup_process(proc, graceful=False)
         _release_slot()
         raise
 
@@ -883,7 +1230,7 @@ async def chat_completions(request: Request):
         )
         return JSONResponse(
             status_code=500,
-            content={"error": {"message": f"Claude CLI error: {stderr.decode()}", "type": "server_error"}},
+            content={"error": {"message": f"{_cli_error_label()} error: {stderr.decode()}", "type": "server_error"}},
         )
 
     return JSONResponse(content=make_chat_response(result_text, model, usage))
@@ -924,7 +1271,8 @@ async def responses(request: Request):
     if routed:
         _stats_key = f"routed_to_{model}_total"
         _stats[_stats_key] = _stats.get(_stats_key, 0) + 1
-    cmd, stdin_text = build_claude_cmd(prompt, system_prompt, model)
+    cmd, stdin_text = build_cli_cmd(prompt, system_prompt, model)
+    request_cwd = _request_cwd(request)
 
     if not await _acquire_slot():
         _stats["capacity_rejections_total"] += 1
@@ -934,16 +1282,8 @@ async def responses(request: Request):
         )
 
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            env=_subprocess_env,
-        )
-        proc.stdin.write(stdin_text.encode())
-        proc.stdin.write_eof()
-    except OSError as exc:
+        proc = await _spawn_cli_process(cmd, stdin_text, model, request_cwd)
+    except Exception as exc:
         _stats["subprocess_start_failures_total"] += 1
         logger.exception("subprocess_start_failed model=%s", model)
         if sentry_sdk is not None:
@@ -954,8 +1294,6 @@ async def responses(request: Request):
             content={"error": {"message": f"Failed to start subprocess: {exc}", "type": "server_error"}},
         )
 
-    _active_processes.add(proc)
-
     if stream:
         response_id = f"resp_{uuid.uuid4().hex[:24]}"
         message_id = f"msg_{uuid.uuid4().hex[:24]}"
@@ -963,6 +1301,7 @@ async def responses(request: Request):
         async def generate():
             output_text = ""
             usage = {}
+            saw_app_server_delta = False
             try:
                 deadline = time.monotonic() + _request_timeout
                 yield "data: " + json.dumps({
@@ -988,30 +1327,29 @@ async def responses(request: Request):
                     except json.JSONDecodeError:
                         continue
 
-                    if event.get("type") == "result":
-                        usage = event.get("usage", {})
-                        if event.get("result"):
-                            output_text = event.get("result")
-                        continue
-
-                    if event.get("type") != "stream_event":
-                        continue
-
-                    inner = event.get("event", {})
-                    if inner.get("type") == "content_block_delta":
-                        delta = inner.get("delta", {})
-                        if delta.get("type") == "text_delta":
-                            text = delta.get("text", "")
-                            if text:
-                                output_text += text
-                                yield "data: " + json.dumps({
-                                    "type": "response.output_text.delta",
-                                    "response_id": response_id,
-                                    "item_id": message_id,
-                                    "output_index": 0,
-                                    "content_index": 0,
-                                    "delta": text,
-                                }) + "\n\n"
+                    event_error = _app_server_event_error(event)
+                    if event_error:
+                        raise RuntimeError(event_error)
+                    text, event_usage = _stream_event_data(event)
+                    if event.get("method") == "item/agentMessage/delta":
+                        saw_app_server_delta = True
+                    elif not saw_app_server_delta:
+                        text = text or _app_server_completed_text(event)
+                    if event_usage:
+                        usage = event_usage
+                    if text:
+                        output_text += text
+                    for text_chunk in _stream_text_chunks(text):
+                        yield "data: " + json.dumps({
+                            "type": "response.output_text.delta",
+                            "response_id": response_id,
+                            "item_id": message_id,
+                            "output_index": 0,
+                            "content_index": 0,
+                            "delta": text_chunk,
+                        }) + "\n\n"
+                    if _cli_event_done(event):
+                        break
 
                 await proc.wait()
                 yield "data: " + json.dumps({
@@ -1067,14 +1405,14 @@ async def responses(request: Request):
     except asyncio.TimeoutError:
         _stats["timeouts_total"] += 1
         logger.warning("request_timeout model=%s endpoint=responses", model)
-        await _cleanup_process(proc)
+        await _cleanup_process(proc, graceful=False)
         _release_slot()
         return JSONResponse(
             status_code=504,
             content={"error": {"message": "Request timed out", "type": "timeout_error"}},
         )
     except Exception:
-        await _cleanup_process(proc)
+        await _cleanup_process(proc, graceful=False)
         _release_slot()
         raise
 
@@ -1091,7 +1429,7 @@ async def responses(request: Request):
         )
         return JSONResponse(
             status_code=500,
-            content={"error": {"message": f"Claude CLI error: {stderr.decode()}", "type": "server_error"}},
+            content={"error": {"message": f"{_cli_error_label()} error: {stderr.decode()}", "type": "server_error"}},
         )
 
     return JSONResponse(content=make_responses_response(result_text, model, usage))
@@ -1135,7 +1473,8 @@ async def anthropic_messages(request: Request):
     if routed:
         _stats_key = f"routed_to_{model}_total"
         _stats[_stats_key] = _stats.get(_stats_key, 0) + 1
-    cmd, stdin_text = build_claude_cmd(prompt, system_prompt, model, force_json=force_json)
+    cmd, stdin_text = build_cli_cmd(prompt, system_prompt, model, force_json=force_json)
+    request_cwd = _request_cwd(request)
 
     if not await _acquire_slot():
         _stats["capacity_rejections_total"] += 1
@@ -1148,17 +1487,8 @@ async def anthropic_messages(request: Request):
         )
 
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=os.environ.get("CLAUDE_RELAY_CWD", None),
-            env=_subprocess_env,
-        )
-        proc.stdin.write(stdin_text.encode())
-        proc.stdin.write_eof()
-    except OSError as exc:
+        proc = await _spawn_cli_process(cmd, stdin_text, model, request_cwd)
+    except Exception as exc:
         _stats["subprocess_start_failures_total"] += 1
         logger.exception("subprocess_start_failed model=%s", model)
         if sentry_sdk is not None:
@@ -1172,12 +1502,11 @@ async def anthropic_messages(request: Request):
             },
         )
 
-    _active_processes.add(proc)
-
     if stream:
         msg_id = f"msg_{uuid.uuid4().hex[:24]}"
 
         async def generate():
+            saw_app_server_delta = False
             try:
                 deadline = time.monotonic() + _request_timeout
                 # message_start
@@ -1211,21 +1540,24 @@ async def anthropic_messages(request: Request):
                         event = json.loads(line)
                     except json.JSONDecodeError:
                         continue
-                    if event.get("type") != "stream_event":
-                        continue
-                    inner = event.get("event", {})
-                    if inner.get("type") == "content_block_delta":
-                        delta = inner.get("delta", {})
-                        if delta.get("type") == "text_delta":
-                            text = delta.get("text", "")
-                            if text:
-                                yield make_anthropic_stream_event("content_block_delta", {
-                                    "type": "content_block_delta",
-                                    "index": 0,
-                                    "delta": {"type": "text_delta", "text": text},
-                                })
-                    elif inner.get("type") == "message_delta":
-                        output_tokens = inner.get("usage", {}).get("output_tokens", 0)
+                    event_error = _app_server_event_error(event)
+                    if event_error:
+                        raise RuntimeError(event_error)
+                    text, event_usage = _stream_event_data(event)
+                    if event.get("method") == "item/agentMessage/delta":
+                        saw_app_server_delta = True
+                    elif not saw_app_server_delta:
+                        text = text or _app_server_completed_text(event)
+                    if event_usage:
+                        output_tokens = event_usage.get("output_tokens", output_tokens)
+                    for text_chunk in _stream_text_chunks(text):
+                        yield make_anthropic_stream_event("content_block_delta", {
+                            "type": "content_block_delta",
+                            "index": 0,
+                            "delta": {"type": "text_delta", "text": text_chunk},
+                        })
+                    if _cli_event_done(event):
+                        break
                 # content_block_stop
                 yield make_anthropic_stream_event("content_block_stop", {
                     "type": "content_block_stop",
@@ -1259,7 +1591,7 @@ async def anthropic_messages(request: Request):
     except asyncio.TimeoutError:
         _stats["timeouts_total"] += 1
         logger.warning("request_timeout model=%s endpoint=messages", model)
-        await _cleanup_process(proc)
+        await _cleanup_process(proc, graceful=False)
         _release_slot()
         return JSONResponse(
             status_code=504,
@@ -1269,7 +1601,7 @@ async def anthropic_messages(request: Request):
             },
         )
     except Exception:
-        await _cleanup_process(proc)
+        await _cleanup_process(proc, graceful=False)
         _release_slot()
         raise
 
@@ -1288,7 +1620,7 @@ async def anthropic_messages(request: Request):
             status_code=500,
             content={
                 "type": "error",
-                "error": {"type": "server_error", "message": f"Claude CLI error: {stderr.decode()}"},
+                "error": {"type": "server_error", "message": f"{_cli_error_label()} error: {stderr.decode()}"},
             },
         )
 

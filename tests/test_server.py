@@ -14,6 +14,7 @@ from claude_relay.server import (
     _select_model,
     app,
     build_claude_cmd,
+    build_codex_cmd,
     build_prompt,
     build_prompt_anthropic,
     build_prompt_responses,
@@ -190,6 +191,31 @@ class TestBuildClaudeCmd:
         assert "--system-prompt" not in cmd
 
 
+class TestBuildCodexCmd:
+    def test_subscription_cli_command(self):
+        cmd, stdin_text = build_codex_cmd("Hi", None, "gpt-5.6-sol")
+        assert cmd == ["codex", "app-server", "--stdio"]
+        assert stdin_text == "Hi"
+
+    def test_exec_protocol_fallback(self):
+        with patch(f"{MODULE}._codex_protocol", "exec"):
+            cmd, stdin_text = build_codex_cmd("Hi", None, "gpt-5.6-sol")
+        assert cmd[:3] == ["codex", "exec", "--json"]
+        assert "--ephemeral" in cmd
+        assert cmd[cmd.index("--model") + 1] == "gpt-5.6-sol"
+        assert cmd[-1] == "-"
+        assert stdin_text == "Hi"
+
+    def test_system_prompt_uses_stdin(self):
+        cmd, stdin_text = build_codex_cmd("Hi", "Be concise.", "gpt-5.6-sol")
+        assert "--system-prompt" not in cmd
+        assert stdin_text == "System instructions:\nBe concise.\n\nHi"
+
+    def test_force_json_instruction(self):
+        _, stdin_text = build_codex_cmd("Hi", None, "gpt-5.6-sol", force_json=True)
+        assert "valid JSON object" in stdin_text
+
+
 # ---------------------------------------------------------------------------
 # Unit tests: smart routing
 # ---------------------------------------------------------------------------
@@ -220,6 +246,15 @@ class TestSmartRouting:
         with patch(f"{MODULE}._routing_classifier_backend", "invalid"):
             with pytest.raises(RuntimeError):
                 _select_model("auto", "hello", message_count=1)
+
+    def test_codex_maps_claude_model_to_default(self):
+        with (
+            patch(f"{MODULE}._backend", "codex"),
+            patch(f"{MODULE}._routing_default_model", "gpt-5.6-sol"),
+        ):
+            model, routed = _select_model("claude-sonnet-4-6", "hello")
+        assert model == "gpt-5.6-sol"
+        assert routed is False
 
 
 # ---------------------------------------------------------------------------
@@ -341,6 +376,42 @@ async def test_non_streaming_with_system_prompt(client):
     cmd = mock_exec.call_args[0]
     idx = list(cmd).index("--system-prompt")
     assert cmd[idx + 1] == "You are a pirate."
+
+
+@pytest.mark.anyio
+async def test_request_working_directory_header(client, tmp_path):
+    data = _make_claude_stream_lines(["Done"])
+    proc = _mock_process(data.encode())
+
+    with patch(f"{MODULE}.asyncio.create_subprocess_exec", return_value=proc) as mock_exec:
+        resp = await client.post(
+            "/v1/chat/completions",
+            headers={"X-Agent-Relay-Cwd": str(tmp_path)},
+            json={
+                "model": "sonnet",
+                "messages": [{"role": "user", "content": "Hi"}],
+            },
+        )
+
+    assert resp.status_code == 200
+    assert mock_exec.call_args.kwargs["cwd"] == str(tmp_path.resolve())
+    assert mock_exec.call_args.kwargs["limit"] == _server_mod._subprocess_stream_limit
+    assert mock_exec.call_args.kwargs["limit"] > 64 * 1024
+
+
+@pytest.mark.anyio
+async def test_invalid_request_working_directory(client, tmp_path):
+    resp = await client.post(
+        "/v1/chat/completions",
+        headers={"X-Agent-Relay-Cwd": str(tmp_path / "missing")},
+        json={
+            "model": "sonnet",
+            "messages": [{"role": "user", "content": "Hi"}],
+        },
+    )
+
+    assert resp.status_code == 400
+    assert "working directory does not exist" in resp.json()["detail"]
 
 
 @pytest.mark.anyio
@@ -753,6 +824,41 @@ async def test_anthropic_streaming(client):
 
 
 @pytest.mark.anyio
+async def test_anthropic_streaming_splits_large_codex_message(client):
+    output_text = "x" * 600
+    data = "\n".join([
+        json.dumps({
+            "type": "item.completed",
+            "item": {"type": "agent_message", "text": output_text},
+        }),
+        json.dumps({
+            "type": "turn.completed",
+            "usage": {"input_tokens": 10, "output_tokens": 150},
+        }),
+    ]) + "\n"
+    proc = _mock_process(data.encode())
+
+    with patch(f"{MODULE}.asyncio.create_subprocess_exec", return_value=proc):
+        resp = await client.post("/v1/messages", json={
+            "model": "sonnet",
+            "max_tokens": 1024,
+            "messages": [{"role": "user", "content": "Write a long line"}],
+            "stream": True,
+        })
+
+    deltas = []
+    for line in resp.text.splitlines():
+        if not line.startswith("data: "):
+            continue
+        event = json.loads(line[6:])
+        if event.get("type") == "content_block_delta":
+            deltas.append(event["delta"]["text"])
+
+    assert [len(delta) for delta in deltas] == [256, 256, 88]
+    assert "".join(deltas) == output_text
+
+
+@pytest.mark.anyio
 async def test_anthropic_system_prompt(client):
     data = _make_claude_stream_lines(["Arrr!"])
     proc = _mock_process(data.encode())
@@ -878,6 +984,7 @@ class TestRequestTimeout:
         proc = AsyncMock()
         proc.returncode = None
         proc.wait = AsyncMock(return_value=0)
+        proc.terminate = Mock()
         proc.kill = Mock()
         proc.stderr = AsyncMock()
         proc.stderr.read = AsyncMock(return_value=b"")
@@ -895,7 +1002,8 @@ class TestRequestTimeout:
 
         assert resp.status_code == 504
         assert resp.json()["error"]["type"] == "timeout_error"
-        proc.kill.assert_called_once()
+        proc.terminate.assert_called_once()
+        proc.kill.assert_not_called()
 
     @pytest.mark.anyio
     async def test_timeout_anthropic(self, client):
@@ -905,6 +1013,7 @@ class TestRequestTimeout:
         proc = AsyncMock()
         proc.returncode = None
         proc.wait = AsyncMock(return_value=0)
+        proc.terminate = Mock()
         proc.kill = Mock()
         proc.stderr = AsyncMock()
         proc.stderr.read = AsyncMock(return_value=b"")
@@ -923,24 +1032,28 @@ class TestRequestTimeout:
 
         assert resp.status_code == 504
         assert resp.json()["error"]["type"] == "timeout_error"
-        proc.kill.assert_called_once()
+        proc.terminate.assert_called_once()
+        proc.kill.assert_not_called()
 
 
 class TestSubprocessCleanup:
     @pytest.mark.anyio
     async def test_cleanup_kills_running_process(self):
-        """_cleanup_process kills a subprocess that is still running."""
+        """_cleanup_process terminates a subprocess that ignores EOF."""
         proc = AsyncMock()
         proc.returncode = None
+        proc.stdin = None
+        proc.terminate = Mock()
         proc.kill = Mock()
-        proc.wait = AsyncMock()
+        proc.wait = AsyncMock(side_effect=[asyncio.TimeoutError(), 0])
 
         _server_mod._active_processes.add(proc)
 
         await _cleanup_process(proc)
 
-        proc.kill.assert_called_once()
-        proc.wait.assert_awaited_once()
+        proc.terminate.assert_called_once()
+        proc.kill.assert_not_called()
+        assert proc.wait.await_count == 2
         assert proc not in _server_mod._active_processes
 
     @pytest.mark.anyio
