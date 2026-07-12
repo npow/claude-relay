@@ -194,6 +194,12 @@ class TestBuildClaudeCmd:
 class TestBuildCodexCmd:
     def test_subscription_cli_command(self):
         cmd, stdin_text = build_codex_cmd("Hi", None, "gpt-5.6-sol")
+        assert cmd == ["codex", "app-server", "--stdio"]
+        assert stdin_text == "Hi"
+
+    def test_exec_protocol_fallback(self):
+        with patch(f"{MODULE}._codex_protocol", "exec"):
+            cmd, stdin_text = build_codex_cmd("Hi", None, "gpt-5.6-sol")
         assert cmd[:3] == ["codex", "exec", "--json"]
         assert "--ephemeral" in cmd
         assert cmd[cmd.index("--model") + 1] == "gpt-5.6-sol"
@@ -978,6 +984,7 @@ class TestRequestTimeout:
         proc = AsyncMock()
         proc.returncode = None
         proc.wait = AsyncMock(return_value=0)
+        proc.terminate = Mock()
         proc.kill = Mock()
         proc.stderr = AsyncMock()
         proc.stderr.read = AsyncMock(return_value=b"")
@@ -995,7 +1002,8 @@ class TestRequestTimeout:
 
         assert resp.status_code == 504
         assert resp.json()["error"]["type"] == "timeout_error"
-        proc.kill.assert_called_once()
+        proc.terminate.assert_called_once()
+        proc.kill.assert_not_called()
 
     @pytest.mark.anyio
     async def test_timeout_anthropic(self, client):
@@ -1005,6 +1013,7 @@ class TestRequestTimeout:
         proc = AsyncMock()
         proc.returncode = None
         proc.wait = AsyncMock(return_value=0)
+        proc.terminate = Mock()
         proc.kill = Mock()
         proc.stderr = AsyncMock()
         proc.stderr.read = AsyncMock(return_value=b"")
@@ -1023,24 +1032,28 @@ class TestRequestTimeout:
 
         assert resp.status_code == 504
         assert resp.json()["error"]["type"] == "timeout_error"
-        proc.kill.assert_called_once()
+        proc.terminate.assert_called_once()
+        proc.kill.assert_not_called()
 
 
 class TestSubprocessCleanup:
     @pytest.mark.anyio
     async def test_cleanup_kills_running_process(self):
-        """_cleanup_process kills a subprocess that is still running."""
+        """_cleanup_process terminates a subprocess that ignores EOF."""
         proc = AsyncMock()
         proc.returncode = None
+        proc.stdin = None
+        proc.terminate = Mock()
         proc.kill = Mock()
-        proc.wait = AsyncMock()
+        proc.wait = AsyncMock(side_effect=[asyncio.TimeoutError(), 0])
 
         _server_mod._active_processes.add(proc)
 
         await _cleanup_process(proc)
 
-        proc.kill.assert_called_once()
-        proc.wait.assert_awaited_once()
+        proc.terminate.assert_called_once()
+        proc.kill.assert_not_called()
+        assert proc.wait.await_count == 2
         assert proc not in _server_mod._active_processes
 
     @pytest.mark.anyio

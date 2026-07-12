@@ -248,6 +248,7 @@ Environment variables:
 | `AGENT_RELAY_ROUTE_MODEL_MEDIUM` | `sonnet` | Model for MEDIUM tier |
 | `AGENT_RELAY_ROUTE_MODEL_COMPLEX` | `opus` | Model for COMPLEX tier |
 | `AGENT_RELAY_ROUTE_MODEL_REASONING` | `opus` | Model for REASONING tier |
+| `AGENT_RELAY_CODEX_PROTOCOL` | `app-server` | Codex protocol (`app-server` for live deltas, `exec` fallback) |
 | `AGENT_RELAY_STREAM_CHUNK_SIZE` | `256` | Maximum characters per streamed text delta |
 | `AGENT_RELAY_SUBPROCESS_STREAM_LIMIT` | `8388608` | Maximum bytes accepted in one CLI JSONL event |
 

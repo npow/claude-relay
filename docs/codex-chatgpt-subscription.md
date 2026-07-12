@@ -110,7 +110,7 @@ claude-codex
 
 The relay validates that directory and uses it as the cwd for the request's Codex subprocess. The service `WorkingDirectory` and `CLAUDE_RELAY_CWD` remain fallbacks for clients that do not send the header.
 
-`codex exec --json` emits completed assistant messages rather than token-sized text events. The relay can only forward the answer after Codex completes it; true token streaming would require the experimental Codex app-server protocol. Once the completed event arrives, the relay splits it into 256-character SSE deltas. Set `AGENT_RELAY_STREAM_CHUNK_SIZE` before starting the service to tune that limit.
+The Codex backend uses the experimental app-server protocol by default and forwards `item/agentMessage/delta` notifications as they arrive, providing real incremental text streaming. Set `AGENT_RELAY_CODEX_PROTOCOL=exec` to use the older buffered `codex exec --json` fallback. Oversized deltas are split at 256 characters; set `AGENT_RELAY_STREAM_CHUNK_SIZE` to tune that limit.
 
 Codex tool events can be much larger than assistant messages. The relay raises asyncio's default 64 KiB subprocess line limit to 8 MiB so a large JSONL tool event does not terminate the stream. Set `AGENT_RELAY_SUBPROCESS_STREAM_LIMIT` to override this bound.
 
