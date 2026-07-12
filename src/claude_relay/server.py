@@ -58,6 +58,10 @@ _stream_chunk_size: int = max(
     1,
     int(os.environ.get("AGENT_RELAY_STREAM_CHUNK_SIZE", "256")),
 )
+_subprocess_stream_limit: int = max(
+    64 * 1024,
+    int(os.environ.get("AGENT_RELAY_SUBPROCESS_STREAM_LIMIT", str(8 * 1024 * 1024))),
+)
 _active_processes: set = set()
 _backend: str = os.environ.get("AGENT_RELAY_BACKEND", "claude").lower()
 _relay_env_vars = {"ANTHROPIC_BASE_URL", "OPENAI_BASE_URL", "CLAUDECODE"}
@@ -929,6 +933,7 @@ async def chat_completions(request: Request):
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            limit=_subprocess_stream_limit,
             cwd=request_cwd,
             env=_subprocess_environment(),
         )
@@ -1070,6 +1075,7 @@ async def responses(request: Request):
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            limit=_subprocess_stream_limit,
             cwd=request_cwd,
             env=_subprocess_environment(),
         )
@@ -1276,6 +1282,7 @@ async def anthropic_messages(request: Request):
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            limit=_subprocess_stream_limit,
             cwd=request_cwd,
             env=_subprocess_environment(),
         )

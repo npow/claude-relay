@@ -1,5 +1,6 @@
 """Focused tests for the Codex backend and Linux service configuration."""
 
+import asyncio
 import json
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -56,6 +57,16 @@ def test_large_codex_message_is_split_without_data_loss():
     chunks = list(server._stream_text_chunks(text))
     assert [len(chunk) for chunk in chunks] == [256, 256, 88]
     assert "".join(chunks) == text
+
+
+@pytest.mark.anyio
+async def test_stream_reader_limit_accepts_large_jsonl_event():
+    reader = asyncio.StreamReader(limit=server._subprocess_stream_limit)
+    reader.feed_data(json.dumps({"text": "x" * 70000}).encode() + b"\n")
+    reader.feed_eof()
+    line = await reader.readline()
+    assert len(line) > 64 * 1024
+    assert json.loads(line)["text"] == "x" * 70000
 
 
 def test_systemd_unit_selects_codex_subscription_model():

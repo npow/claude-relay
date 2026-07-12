@@ -389,6 +389,8 @@ async def test_request_working_directory_header(client, tmp_path):
 
     assert resp.status_code == 200
     assert mock_exec.call_args.kwargs["cwd"] == str(tmp_path.resolve())
+    assert mock_exec.call_args.kwargs["limit"] == _server_mod._subprocess_stream_limit
+    assert mock_exec.call_args.kwargs["limit"] > 64 * 1024
 
 
 @pytest.mark.anyio
