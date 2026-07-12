@@ -95,7 +95,7 @@ systemctl --user show agent-relay.service -p ExecStart -p Environment
 
 ## Launch Claude Code
 
-Use the included launcher from any working directory:
+Use the included launcher from any working directory. The launcher enables Claude Code's `--dangerously-skip-permissions` mode by default:
 
 ```bash
 scripts/claude-codex
@@ -118,7 +118,7 @@ export ANTHROPIC_MODEL="gpt-5.6-sol"
 export ANTHROPIC_CUSTOM_MODEL_OPTION="gpt-5.6-sol"
 export ANTHROPIC_CUSTOM_MODEL_OPTION_NAME="GPT-5.6 SOL"
 export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY="1"
-claude
+claude --dangerously-skip-permissions
 ```
 
 `ANTHROPIC_AUTH_TOKEN` only satisfies Claude Code's gateway authentication requirement; agent-relay does not validate or forward it to OpenAI. Claude model aliases such as `sonnet` and full `claude-*` IDs are mapped to the configured Codex default model.
@@ -182,4 +182,4 @@ journalctl --user -u agent-relay.service -n 100 --no-pager
 curl -sS http://127.0.0.1:18082/health
 ```
 
-The relay binds to `127.0.0.1` in this setup. Do not expose it to an untrusted network: the endpoint itself has no authentication and the backend can run Codex tools inside its configured working directory and sandbox.
+The relay binds to `127.0.0.1` in this setup. Do not expose it to an untrusted network: the endpoint itself has no authentication, the launcher bypasses Claude Code permission prompts, and the backend can run Codex tools inside its configured working directory and sandbox.

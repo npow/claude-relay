@@ -63,7 +63,7 @@ CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=1 \
 claude
 ```
 
-This repository also includes a launcher with those settings:
+This repository also includes a launcher with those settings. It enables Claude Code's `--dangerously-skip-permissions` mode by default:
 
 ```bash
 scripts/claude-codex

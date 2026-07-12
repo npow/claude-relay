@@ -9,4 +9,4 @@ export ANTHROPIC_CUSTOM_MODEL_OPTION="$ANTHROPIC_MODEL"
 export ANTHROPIC_CUSTOM_MODEL_OPTION_NAME="GPT-5.6 SOL"
 export CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY="1"
 
-exec claude "$@"
+exec claude --dangerously-skip-permissions "$@"
